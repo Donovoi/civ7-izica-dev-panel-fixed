@@ -21,6 +21,13 @@ export const Actions = new (class {
   // Track the unit currently being assigned to a commander.
   reinforcementInFlight = null;
 
+  // Hold the queued reinforcement actions for the current sweep.
+  reinforcementQueue = [];
+
+  // Track total/processed units for the current visible reinforcement pass.
+  manualReinforcementTotal = 0;
+  manualReinforcementProcessed = 0;
+
   // Track whether the user manually kicked off a commander-upgrade sweep.
   manualCommanderUpgradeRequested = false;
 
@@ -62,6 +69,9 @@ export const Actions = new (class {
     "toggle-dev-console": "Show or hide the dev panel console.",
     "reload-ui": "Reload the Civilization VII UI.",
   };
+
+  // Cache static promotion tree metadata by promotion class so commander upgrades stay fast.
+  promotionMetadataByClass = new Map();
 
   // Prevent multiple delayed refreshes from piling up at once.
   commanderAdminRefreshScheduled = false;
@@ -421,10 +431,8 @@ export const Actions = new (class {
 
     this.commanderAdminRefreshScheduled = true;
     requestAnimationFrame(() => {
-      requestAnimationFrame(() => {
-        this.commanderAdminRefreshScheduled = false;
-        this.processAdminQueues();
-      });
+      this.commanderAdminRefreshScheduled = false;
+      this.processAdminQueues();
     });
   }
 
@@ -435,6 +443,94 @@ export const Actions = new (class {
       Y: -9999,
       UnitAbilityType: -1,
     };
+  }
+
+  // Collect callable method names from a native-backed game component for debugging/fallbacks.
+  getCallablePropertyNames(target) {
+    if (!target) {
+      return [];
+    }
+
+    const names = new Set();
+    let current = target;
+
+    while (current && current !== Object.prototype) {
+      Object.getOwnPropertyNames(current).forEach((name) => {
+        if (name === "constructor") {
+          return;
+        }
+
+        try {
+          if (typeof target[name] === "function") {
+            names.add(name);
+          }
+        } catch (_error) {
+          // Some native-backed properties may throw during reflection; ignore those.
+        }
+      });
+
+      current = Object.getPrototypeOf(current);
+    }
+
+    return [...names];
+  }
+
+  // Snapshot the player happiness/celebration state so we can tell whether a mutation actually worked.
+  captureHappinessState(player = this.getLocalPlayer()) {
+    const stats = player?.Stats;
+    const happiness = player?.Happiness;
+
+    return {
+      lifetimeHappiness: Number(
+        stats?.getLifetimeYield?.(YieldTypes.YIELD_HAPPINESS) ?? 0,
+      ),
+      netHappinessPerTurn: Number(
+        stats?.getNetYield?.(YieldTypes.YIELD_HAPPINESS) ?? 0,
+      ),
+      nextGoldenAgeThreshold: Number(happiness?.nextGoldenAgeThreshold ?? 0),
+      goldenAgeTurnsLeft: Number(happiness?.getGoldenAgeTurnsLeft?.() ?? 0),
+      isInGoldenAge: Boolean(happiness?.isInGoldenAge?.()),
+    };
+  }
+
+  // Compare two happiness snapshots to see whether the game state changed.
+  hasHappinessStateChanged(beforeState, afterState) {
+    return (
+      beforeState.lifetimeHappiness !== afterState.lifetimeHappiness ||
+      beforeState.netHappinessPerTurn !== afterState.netHappinessPerTurn ||
+      beforeState.nextGoldenAgeThreshold !== afterState.nextGoldenAgeThreshold ||
+      beforeState.goldenAgeTurnsLeft !== afterState.goldenAgeTurnsLeft ||
+      beforeState.isInGoldenAge !== afterState.isInGoldenAge
+    );
+  }
+
+  // Try a small list of plausible native mutation methods until one produces a visible happiness change.
+  tryInvokeMutationMethods(target, methodNames, argLists, beforeState, captureState) {
+    if (!target) {
+      return false;
+    }
+
+    for (const methodName of methodNames) {
+      const method = target[methodName];
+
+      if (typeof method !== "function") {
+        continue;
+      }
+
+      for (const args of argLists) {
+        try {
+          method.apply(target, args);
+        } catch (_error) {
+          continue;
+        }
+
+        if (this.hasHappinessStateChanged(beforeState, captureState())) {
+          return true;
+        }
+      }
+    }
+
+    return false;
   }
 
   // Check whether a component ID already exists inside a small in-memory list.
@@ -454,6 +550,11 @@ export const Actions = new (class {
     return this.getCommanderUnits().filter((commander) =>
       Boolean(this.getNextCommanderAdminAction(commander)),
     ).length;
+  }
+
+  // Count how many commander entries are currently pending in the fast in-memory queue.
+  getPendingCommanderQueueCount() {
+    return this.commanderAdminQueue.length + (this.commanderAdminInFlight ? 1 : 0);
   }
 
   // Count how many local non-commander units can currently reinforce into a commander.
@@ -477,17 +578,22 @@ export const Actions = new (class {
   // Keep the commander/admin status line in sync while a manual action is running.
   updateManualAdminStatus() {
     if (this.manualReinforcementRequested) {
-      const remainingUnits = this.getReinforceableUnitsCount();
+      const remainingUnits =
+        this.reinforcementQueue.length + (this.reinforcementInFlight ? 1 : 0);
+      const completedUnits = Math.min(
+        this.manualReinforcementProcessed,
+        this.manualReinforcementTotal,
+      );
       this.setCommanderStatus(
-        remainingUnits > 0
-          ? `Reinforcing units… ${remainingUnits} still available`
+        this.manualReinforcementTotal > 0
+          ? `Reinforcing units… ${completedUnits}/${this.manualReinforcementTotal} done, ${remainingUnits} left`
           : "Reinforcing units…",
       );
       return;
     }
 
     if (this.manualCommanderUpgradeRequested) {
-      const remainingCommanders = this.getCommandersWithAdminActionsCount();
+      const remainingCommanders = this.getPendingCommanderQueueCount();
       this.setCommanderStatus(
         remainingCommanders > 0
           ? `Upgrading commanders… ${remainingCommanders} still need actions`
@@ -514,6 +620,8 @@ export const Actions = new (class {
     if (this.manualReinforcementRequested && this.manualCommanderUpgradeRequested) {
       this.manualReinforcementRequested = false;
       this.manualCommanderUpgradeRequested = false;
+      this.manualReinforcementProcessed = 0;
+      this.manualReinforcementTotal = 0;
       this.setCommanderStatus("Commander tasks finished.");
       console.log("Dev panel: commander tasks finished.");
       this.refreshSelectedUnitUI();
@@ -523,8 +631,14 @@ export const Actions = new (class {
 
     if (this.manualReinforcementRequested) {
       this.manualReinforcementRequested = false;
-      this.setCommanderStatus("Reinforcement sweep finished.");
-      console.log("Dev panel: reinforcement sweep finished.");
+      this.setCommanderStatus(
+        `Reinforcement sweep finished (${this.manualReinforcementProcessed}/${this.manualReinforcementTotal}).`,
+      );
+      console.log(
+        `Dev panel: reinforcement sweep finished (${this.manualReinforcementProcessed}/${this.manualReinforcementTotal}).`,
+      );
+      this.manualReinforcementProcessed = 0;
+      this.manualReinforcementTotal = 0;
       this.refreshSelectedUnitUI();
       this.scheduleCommanderStatusReset();
       return;
@@ -578,55 +692,107 @@ export const Actions = new (class {
     return bestPlot;
   }
 
-  // Find the next unit that can currently reinforce into any eligible commander.
-  getNextReinforcementAction(skippedUnitIds = []) {
-    let bestAction = null;
-    let bestScore = Number.POSITIVE_INFINITY;
+  // Build a current reinforcement action for one unit if the engine says it is valid right now.
+  getReinforcementActionForUnit(unitId) {
+    const unit = Units.get(unitId);
 
-    for (const unit of this.getLocalUnits()) {
-      if (
-        !unit ||
-        unit.isCommanderUnit ||
-        this.isComponentIdInList(skippedUnitIds, unit.id)
-      ) {
-        continue;
-      }
-
-      const result = Game.UnitOperations?.canStart(
-        unit.id,
-        "UNITOPERATION_REINFORCE_ARMY",
-        {},
-        false,
-      );
-
-      if (!result?.Success || !result.Plots?.length) {
-        continue;
-      }
-
-      // We intentionally do not hardcode any slot or stack limit here.
-      // The engine already knows the current free-space and same-slot stacking rules.
-      const targetPlot = this.getBestReinforcementPlot(unit.id, result.Plots);
-
-      if (!targetPlot) {
-        continue;
-      }
-
-      const score = this.getReinforcementScore(unit.id, targetPlot);
-
-      if (bestAction === null || score < bestScore) {
-        bestAction = {
-          unitId: unit.id,
-          targetPlot,
-        };
-        bestScore = score;
-
-        if (score === 0) {
-          return bestAction;
-        }
-      }
+    if (!unit || unit.isCommanderUnit) {
+      return null;
     }
 
-    return bestAction;
+    const result = Game.UnitOperations?.canStart(
+      unit.id,
+      "UNITOPERATION_REINFORCE_ARMY",
+      {},
+      false,
+    );
+
+    if (!result?.Success || !result.Plots?.length) {
+      return null;
+    }
+
+    // We intentionally do not hardcode any slot or stack limit here.
+    // The engine already knows the current free-space and same-slot stacking rules.
+    const targetPlot = this.getBestReinforcementPlot(unit.id, result.Plots);
+
+    if (!targetPlot) {
+      return null;
+    }
+
+    return {
+      unitId: unit.id,
+      targetPlot,
+      score: this.getReinforcementScore(unit.id, targetPlot),
+    };
+  }
+
+  // Build a sorted reinforcement queue from the current game state.
+  buildReinforcementQueue(unitIds = null) {
+    const candidateUnitIds = unitIds ?? this.getLocalUnits().map((unit) => unit.id);
+    const actions = [];
+
+    candidateUnitIds.forEach((unitId) => {
+      if (this.isSameComponentId(this.reinforcementInFlight?.unitId, unitId)) {
+        return;
+      }
+
+      const action = this.getReinforcementActionForUnit(unitId);
+
+      if (action) {
+        actions.push(action);
+      }
+    });
+
+    actions.sort((left, right) => left.score - right.score);
+    return actions;
+  }
+
+  // Check whether a unit already appears in the queued reinforcement list.
+  hasQueuedReinforcementAction(unitId) {
+    return this.reinforcementQueue.some((action) =>
+      this.isSameComponentId(action.unitId, unitId),
+    );
+  }
+
+  // Replace the current reinforcement queue with a fresh snapshot.
+  replaceReinforcementQueue(unitIds = null) {
+    this.reinforcementQueue = this.buildReinforcementQueue(unitIds);
+    this.reinforcementSweepRequested = this.reinforcementQueue.length > 0;
+    return this.reinforcementQueue.length;
+  }
+
+  // Add a single reinforceable unit to the existing queue if it is not already pending.
+  enqueueReinforcementUnit(unitId) {
+    const action = this.getReinforcementActionForUnit(unitId);
+
+    if (
+      !action ||
+      this.hasQueuedReinforcementAction(action.unitId) ||
+      this.isSameComponentId(this.reinforcementInFlight?.unitId, action.unitId)
+    ) {
+      return false;
+    }
+
+    this.reinforcementQueue.push(action);
+    this.reinforcementQueue.sort((left, right) => left.score - right.score);
+    this.reinforcementSweepRequested = true;
+    return true;
+  }
+
+  // Mark one queued reinforcement step as completed and advance manual progress.
+  completeReinforcementStep(unitId) {
+    if (!this.isSameComponentId(this.reinforcementInFlight?.unitId, unitId)) {
+      return;
+    }
+
+    this.reinforcementInFlight = null;
+
+    if (this.manualReinforcementRequested) {
+      this.manualReinforcementProcessed = Math.min(
+        this.manualReinforcementProcessed + 1,
+        this.manualReinforcementTotal,
+      );
+    }
   }
 
   // Send one reinforce request for a unit to the chosen commander plot.
@@ -651,10 +817,10 @@ export const Actions = new (class {
     // Fall back to a delayed refresh in case no immediate engine event fires.
     setTimeout(() => {
       if (this.isSameComponentId(this.reinforcementInFlight?.unitId, unitId)) {
-        this.reinforcementInFlight = null;
+        this.completeReinforcementStep(unitId);
         this.scheduleCommanderAdminProcessing();
       }
-    }, 400);
+    }, 1000);
 
     return true;
   }
@@ -667,33 +833,48 @@ export const Actions = new (class {
     }
 
     if (this.reinforcementSweepRequested) {
-      const skippedUnitIds = [];
+      while (this.reinforcementQueue.length > 0) {
+        const nextReinforcement = this.reinforcementQueue.shift();
+        const refreshedReinforcement = this.getReinforcementActionForUnit(
+          nextReinforcement.unitId,
+        );
 
-      while (this.reinforcementSweepRequested) {
-        const nextReinforcement = this.getNextReinforcementAction(skippedUnitIds);
+        if (!refreshedReinforcement) {
+          if (this.manualReinforcementRequested) {
+            this.manualReinforcementProcessed = Math.min(
+              this.manualReinforcementProcessed + 1,
+              this.manualReinforcementTotal,
+            );
+          }
 
-        if (!nextReinforcement) {
-          this.reinforcementSweepRequested = false;
-          break;
+          continue;
         }
 
         this.reinforcementInFlight = {
-          unitId: nextReinforcement.unitId,
+          unitId: refreshedReinforcement.unitId,
         };
 
         if (
           this.sendReinforcementRequest(
-            nextReinforcement.unitId,
-            nextReinforcement.targetPlot,
+            refreshedReinforcement.unitId,
+            refreshedReinforcement.targetPlot,
           )
         ) {
           this.updateManualAdminStatus();
           return;
         }
 
-        skippedUnitIds.push(nextReinforcement.unitId);
         this.reinforcementInFlight = null;
+
+        if (this.manualReinforcementRequested) {
+          this.manualReinforcementProcessed = Math.min(
+            this.manualReinforcementProcessed + 1,
+            this.manualReinforcementTotal,
+          );
+        }
       }
+
+      this.reinforcementSweepRequested = false;
     }
 
     this.processCommanderAdminQueue();
@@ -755,22 +936,20 @@ export const Actions = new (class {
     return depthCache;
   }
 
-  // Collect every currently available promotion or commendation for a commander.
-  getCommanderPromotionCandidates(commander) {
-    if (!commander?.Experience) {
+  // Build and cache the static promotion metadata for one promotion class.
+  getPromotionMetadataForClass(promotionClassType) {
+    if (!promotionClassType) {
       return [];
     }
 
-    const unitDefinition = GameInfo.Units.lookup(commander.type);
-
-    if (!unitDefinition?.PromotionClass) {
-      return [];
+    if (this.promotionMetadataByClass.has(promotionClassType)) {
+      return this.promotionMetadataByClass.get(promotionClassType);
     }
 
-    const candidates = [];
+    const metadata = [];
 
     GameInfo.UnitPromotionClassSets.forEach((classSet, disciplineIndex) => {
-      if (classSet.PromotionClassType !== unitDefinition.PromotionClass) {
+      if (classSet.PromotionClassType !== promotionClassType) {
         return;
       }
 
@@ -779,7 +958,6 @@ export const Actions = new (class {
           detail.UnitPromotionDisciplineType ===
           classSet.UnitPromotionDisciplineType,
       );
-
       const depthMap = this.getPromotionDepthMap(details);
       const seenPromotionTypes = new Set();
 
@@ -796,27 +974,7 @@ export const Actions = new (class {
           return;
         }
 
-        if (
-          commander.Experience.hasPromotion(
-            classSet.UnitPromotionDisciplineType,
-            detail.UnitPromotionType,
-          )
-        ) {
-          return;
-        }
-
-        if (
-          !commander.Experience.canPromote ||
-          !commander.Experience.canEarnPromotion(
-            classSet.UnitPromotionDisciplineType,
-            detail.UnitPromotionType,
-            false,
-          )
-        ) {
-          return;
-        }
-
-        candidates.push({
+        metadata.push({
           disciplineIndex,
           detailIndex,
           disciplineType: classSet.UnitPromotionDisciplineType,
@@ -827,7 +985,7 @@ export const Actions = new (class {
       });
     });
 
-    return candidates.sort((left, right) => {
+    metadata.sort((left, right) => {
       const commendationWeight =
         Number(right.promotion.Commendation) - Number(left.promotion.Commendation);
 
@@ -849,6 +1007,44 @@ export const Actions = new (class {
 
       return left.promotionType.localeCompare(right.promotionType);
     });
+
+    this.promotionMetadataByClass.set(promotionClassType, metadata);
+    return metadata;
+  }
+
+  // Collect every currently available promotion or commendation for a commander.
+  getCommanderPromotionCandidates(commander) {
+    if (!commander?.Experience) {
+      return [];
+    }
+
+    const unitDefinition = GameInfo.Units.lookup(commander.type);
+
+    if (!unitDefinition?.PromotionClass) {
+      return [];
+    }
+
+    return this.getPromotionMetadataForClass(unitDefinition.PromotionClass).filter(
+      (candidate) => {
+        if (
+          commander.Experience.hasPromotion(
+            candidate.disciplineType,
+            candidate.promotionType,
+          )
+        ) {
+          return false;
+        }
+
+        return Boolean(
+          commander.Experience.canPromote &&
+          commander.Experience.canEarnPromotion(
+            candidate.disciplineType,
+            candidate.promotionType,
+            false,
+          ),
+        );
+      },
+    );
   }
 
   // Choose the next automatic commander admin action, prioritizing promotions and commendations first.
@@ -975,16 +1171,19 @@ export const Actions = new (class {
 
   // Queue every commander for a full admin sweep during autoplay.
   runAutoplayAdminTasks() {
-    this.reinforcementSweepRequested = true;
+    this.replaceReinforcementQueue();
     this.enqueueAllCommandersForAdmin();
     this.processAdminQueues();
   }
 
   // Queue every currently reinforceable unit and let the engine assign them to valid commanders.
   reinforceAllAvailableUnits() {
-    const reinforceableUnits = this.getReinforceableUnitsCount();
+    const reinforceableUnits = this.replaceReinforcementQueue();
 
     if (reinforceableUnits <= 0) {
+      this.manualReinforcementRequested = false;
+      this.manualReinforcementProcessed = 0;
+      this.manualReinforcementTotal = 0;
       this.setCommanderStatus("No units can reinforce right now.");
       console.log("Dev panel: no units can reinforce right now.");
       this.scheduleCommanderStatusReset();
@@ -992,8 +1191,9 @@ export const Actions = new (class {
     }
 
     this.manualReinforcementRequested = true;
-    this.reinforcementSweepRequested = true;
-    this.setCommanderStatus(`Reinforcing units… ${reinforceableUnits} still available`);
+    this.manualReinforcementTotal = reinforceableUnits;
+    this.manualReinforcementProcessed = 0;
+    this.setCommanderStatus(`Reinforcing units… 0/${reinforceableUnits} done, ${reinforceableUnits} left`);
     console.log(`Dev panel: reinforcing ${reinforceableUnits} available unit(s).`);
     this.processAdminQueues();
   }
@@ -1061,7 +1261,7 @@ export const Actions = new (class {
 
     if (Autoplay.isActive) {
       // New local units may be reinforceable immediately.
-      this.reinforcementSweepRequested = true;
+      this.enqueueReinforcementUnit(unit.id);
     }
 
     if (unit.isCommanderUnit) {
@@ -1088,11 +1288,9 @@ export const Actions = new (class {
       return;
     }
 
-    if (this.isSameComponentId(this.reinforcementInFlight?.unitId, unit.id)) {
-      this.reinforcementInFlight = null;
-    }
+    this.completeReinforcementStep(unit.id);
 
-    this.reinforcementSweepRequested = true;
+    this.reinforcementSweepRequested = this.reinforcementQueue.length > 0;
     this.scheduleCommanderAdminProcessing();
   }
 
@@ -1113,11 +1311,9 @@ export const Actions = new (class {
       return;
     }
 
-    if (this.isSameComponentId(this.reinforcementInFlight?.unitId, unit.id)) {
-      this.reinforcementInFlight = null;
-    }
+    this.completeReinforcementStep(unit.id);
 
-    this.reinforcementSweepRequested = true;
+    this.reinforcementSweepRequested = this.reinforcementQueue.length > 0;
     this.scheduleCommanderAdminProcessing();
   }
 
@@ -1131,7 +1327,7 @@ export const Actions = new (class {
       return;
     }
 
-    this.reinforcementSweepRequested = true;
+    this.replaceReinforcementQueue();
     this.scheduleCommanderAdminProcessing();
   }
 
@@ -1177,7 +1373,6 @@ export const Actions = new (class {
       this.commanderAdminInFlight = null;
     }
 
-    this.reinforcementSweepRequested = true;
     this.enqueueCommanderForAdmin(unit.id);
     this.scheduleCommanderAdminProcessing();
   }
@@ -1207,7 +1402,10 @@ export const Actions = new (class {
       this.commanderAdminInFlight = null;
     }
 
-    this.reinforcementSweepRequested = true;
+    if (Autoplay.isActive || this.manualReinforcementRequested || this.reinforcementSweepRequested) {
+      this.replaceReinforcementQueue();
+    }
+
     this.enqueueCommanderForAdmin(unit.id);
     this.scheduleCommanderAdminProcessing();
   }
@@ -1347,14 +1545,117 @@ export const Actions = new (class {
   addHappiness() {
     // Resolve the local player once before granting yields.
     const localPlayerId = this.getLocalPlayerId();
+    const player = this.getLocalPlayer();
 
     // Abort early if there is no active local player.
-    if (localPlayerId === null) {
+    if (localPlayerId === null || !player) {
       return;
     }
 
-    // Grant extra happiness to the current player.
-    Players.grantYield(localPlayerId, YieldTypes.YIELD_HAPPINESS, 100);
+    // Capture the current celebration progress so we can verify that the button actually did something.
+    const beforeState = this.captureHappinessState(player);
+    const captureState = () => this.captureHappinessState(this.getLocalPlayer());
+
+    // First try the obvious yield-grant path.
+    try {
+      Players.grantYield(localPlayerId, YieldTypes.YIELD_HAPPINESS, 1000);
+    } catch (_error) {
+      // Ignore and continue into the native-method fallbacks below.
+    }
+
+    // Some gamecore-backed values update on the next tick, so probe after a short delay.
+    setTimeout(() => {
+      let afterState = captureState();
+
+      if (this.hasHappinessStateChanged(beforeState, afterState)) {
+        console.log(
+          `Dev panel: happiness changed (${beforeState.lifetimeHappiness} -> ${afterState.lifetimeHappiness}).`,
+        );
+        return;
+      }
+
+      const currentPlayer = this.getLocalPlayer();
+      const yieldHash =
+        typeof Database?.makeHash === "function"
+          ? Database.makeHash("YIELD_HAPPINESS")
+          : null;
+
+      const statsMethodNames = [
+        "changeLifetimeYield",
+        "adjustLifetimeYield",
+        "addLifetimeYield",
+        "changeYield",
+        "adjustYield",
+        "addYield",
+        "grantYield",
+      ];
+      const statsArgLists = [
+        [YieldTypes.YIELD_HAPPINESS, 1000],
+        ...(yieldHash !== null ? [[yieldHash, 1000]] : []),
+      ];
+
+      const happinessMethodNames = [
+        "changeHappiness",
+        "adjustHappiness",
+        "addHappiness",
+        "changeProgress",
+        "adjustProgress",
+        "addProgress",
+        "changeCelebrationProgress",
+        "adjustCelebrationProgress",
+        "addCelebrationProgress",
+        "changeGoldenAgeProgress",
+        "adjustGoldenAgeProgress",
+        "addGoldenAgeProgress",
+        "changeGoldenAgePoints",
+        "adjustGoldenAgePoints",
+        "addGoldenAgePoints",
+      ];
+
+      let applied = this.tryInvokeMutationMethods(
+        currentPlayer?.Stats,
+        statsMethodNames,
+        statsArgLists,
+        beforeState,
+        captureState,
+      );
+
+      if (!applied) {
+        applied = this.tryInvokeMutationMethods(
+          currentPlayer?.Happiness,
+          happinessMethodNames,
+          [[1000]],
+          beforeState,
+          captureState,
+        );
+      }
+
+      afterState = captureState();
+
+      if (applied || this.hasHappinessStateChanged(beforeState, afterState)) {
+        console.log(
+          `Dev panel: happiness changed (${beforeState.lifetimeHappiness} -> ${afterState.lifetimeHappiness}).`,
+        );
+        return;
+      }
+
+      const statsMethods = this.getCallablePropertyNames(currentPlayer?.Stats)
+        .filter((name) => /yield|lifetime/i.test(name))
+        .slice(0, 20);
+      const happinessMethods = this.getCallablePropertyNames(currentPlayer?.Happiness)
+        .filter((name) => /happiness|golden|celebration|progress/i.test(name))
+        .slice(0, 20);
+
+      console.warn(
+        "Dev panel: could not find a working happiness mutation API.",
+        {
+          beforeState,
+          afterState,
+          statsMethods,
+          happinessMethods,
+        },
+      );
+    }, 50);
   }
 
   startGoldenAge() {
@@ -1372,7 +1673,7 @@ export const Actions = new (class {
 
   addWildcardAttributePoint() {
     // Add one wildcard attribute point if the identity subsystem is available.
-    this.getLocalPlayer()?.Identity?.addWildcardAttributePoints?.(1);
+    this.getLocalPlayer()?.Identity?.addWildcardAttributePoints?.(100000);
   }
 
   reloadUI() {
