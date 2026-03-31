@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Mod id="izica-dev-panel" version="1.2.4.1" xmlns="ModInfo">
+	<Properties>
+		<Name>Izica's dev/cheat panel (fixed)</Name>
+		<Description>Izica's dev/cheat panel, fixed by Lottiliex. No more 40s wait time just to magic up an attribute point! Click CTRL+1 and B if your panel is not visible, and it will return to the original position and size.</Description>
+		<Version>1.2.5.0</Version>
+		<Authors>izica, Lottililex</Authors>
+		<Package>Mod</Package>
+		<AffectsSavedGames>0</AffectsSavedGames>
+	</Properties>
+	<Dependencies>
+		<Mod id="base-standard" title="LOC_MODULE_BASE_STANDARD_NAME" />
+	</Dependencies>
+	<ActionCriteria>
+		<Criteria id="always">
+			<AlwaysMet></AlwaysMet>
+		</Criteria>
+	</ActionCriteria>
+	<ActionGroups>
+		<ActionGroup id="game-fancy-cheat-panel-shell" scope="shell" criteria="always">
+			<Actions>
+				<UpdateDatabase>
+					<Item>data/hotkey.xml</Item>
+				</UpdateDatabase>
+				<UIScripts>
+					<Item>ui/editor-keyboard-mapping.js</Item>
+				</UIScripts>
+			</Actions>
+		</ActionGroup>
+		<ActionGroup id="game-fancy-cheat-panel-game" scope="game" criteria="always">
+			<Properties>
+				<LoadOrder>1500</LoadOrder>
+			</Properties>
+			<Actions>
+				<UIScripts>
+					<Item>ui/editor-keyboard-mapping.js</Item>
+					<Item>ui/dev-panel.js</Item>
+				</UIScripts>
+				<ImportFiles>
+					<Item>ui/dev-panel.html</Item>
+				</ImportFiles>
+			</Actions>
+		</ActionGroup>
+	</ActionGroups>
+</Mod>

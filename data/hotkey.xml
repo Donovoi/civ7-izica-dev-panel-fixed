@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Database>
+    <InputActions>
+        <Row ActionId="toggle-dev-panel" Name="DEVPANEL - Toggle panel" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="toggle-dev-console" Name="DEVPANEL - Toggle dev console" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="reload-ui" Name="DEVPANEL - Reload UI" DeviceType="Keyboard"  Description="DEVPANEL" />
+        <Row ActionId="toggle-infinite-movement" Name="DEVPANEL - Toggle infinite movement" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="complete-production" Name="DEVPANEL - Complete cities production" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="complete-tech" Name="DEVPANEL - Complete tech" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="complete-civic" Name="DEVPANEL - Complete civic" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="add-gold" Name="DEVPANEL - Add gold" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="add-influence" Name="DEVPANEL - Add influence" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="spawn-settler" Name="DEVPANEL - Spawn settler in capital" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="font-increase" Name="DEVPANEL - Increate panel size" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="font-decrease" Name="DEVPANEL - Decrease panel size" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="reset-panel-size" Name="DEVPANEL - Reset panel size" DeviceType="Keyboard" Description="DEVPANEL" />
+    </InputActions>
+    <InputActionDefaultGestures>
+        <Row ActionId="toggle-dev-panel" Index="0" GestureType="KBMouse" GestureData="KEY_B" />
+        <Row ActionId="toggle-dev-console" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_C" />
+        <Row ActionId="reload-ui" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_R" />
+        <Row ActionId="toggle-infinite-movement" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_V" />
+        <Row ActionId="complete-production" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_D" />
+        <Row ActionId="complete-tech" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_Z" />
+        <Row ActionId="complete-civic" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_X" />
+        <Row ActionId="add-gold" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_G" />
+        <Row ActionId="add-influence" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_H" />
+        <Row ActionId="spawn-settler" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_S" />
+        <Row ActionId="font-increase" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_0" />
+        <Row ActionId="font-decrease" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_9" />
+        <Row ActionId="reset-panel-size" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_1" />
+    </InputActionDefaultGestures>
+</Database>
