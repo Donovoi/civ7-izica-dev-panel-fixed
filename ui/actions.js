@@ -15,6 +15,54 @@ export const Actions = new (class {
   // Track the command currently in flight so we do not spam duplicate requests.
   commanderAdminInFlight = null;
 
+  // Track whether a global reinforce-all sweep is currently running.
+  reinforcementSweepRequested = false;
+
+  // Track the unit currently being assigned to a commander.
+  reinforcementInFlight = null;
+
+  // Track whether the user manually kicked off a commander-upgrade sweep.
+  manualCommanderUpgradeRequested = false;
+
+  // Track whether the user manually kicked off a reinforce-all sweep.
+  manualReinforcementRequested = false;
+
+  // Store the timer used to restore the idle status text after a completion message.
+  commanderStatusResetTimer = null;
+
+  // Short hover summaries for the dev-panel buttons.
+  buttonTooltips = {
+    "font-increase": "Increase the dev panel size.",
+    "font-decrease": "Decrease the dev panel size.",
+    "left-decrease": "Move the dev panel left.",
+    "left-increase": "Move the dev panel right.",
+    "add-gold": "Grant 1,000,000 gold.",
+    "add-influence": "Grant 1,000,000 influence.",
+    "add-wildcard-attribute-point": "Grant 1 wildcard attribute point.",
+    "add-happiness": "Grant 100 happiness.",
+    "complete-production": "Complete production in every city.",
+    "add-population": "Add 1 rural population to every city.",
+    "spawn-settler": "Spawn a settler at your capital.",
+    "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or army upgrades.",
+    "reinforce-all-units": "Send every eligible land, sea, and air unit to a valid commander.",
+    "toggle-infinite-movement": "Toggle infinite movement for your units.",
+    "heal-units": "Heal every local unit, including packed and traveling units when possible.",
+    "add-xp": "Grant 10,000,000 XP to every local unit.",
+    "sleep-all-units": "Put every local unit to sleep.",
+    "complete-tech": "Finish the active technology.",
+    "complete-civic": "Finish the active civic.",
+    "autoplay-1": "Start autoplay for 1 turn and run admin automation.",
+    "autoplay-5": "Start autoplay for 5 turns and run admin automation.",
+    "autoplay-10": "Start autoplay for 10 turns and run admin automation.",
+    "autoplay-25": "Start autoplay for 25 turns and run admin automation.",
+    "start-golden-age": "Start a golden age / celebration.",
+    "reveal-map": "Reveal every plot for your player.",
+    "meet-all": "Trigger first contact with every living player.",
+    "transition-to-next-age": "Force the game into the next age.",
+    "toggle-dev-console": "Show or hide the dev panel console.",
+    "reload-ui": "Reload the Civilization VII UI.",
+  };
+
   // Prevent multiple delayed refreshes from piling up at once.
   commanderAdminRefreshScheduled = false;
 
@@ -42,9 +90,15 @@ export const Actions = new (class {
     this.revealMap = this.revealMap.bind(this);
     this.meetAll = this.meetAll.bind(this);
     this.upgradeSelectedCommander = this.upgradeSelectedCommander.bind(this);
+    this.reinforceAllAvailableUnits = this.reinforceAllAvailableUnits.bind(this);
+    this.refreshSelectedUnitUI = this.refreshSelectedUnitUI.bind(this);
+    this.finishManualAdminStatusIfIdle = this.finishManualAdminStatusIfIdle.bind(this);
     this.onAutoplayStarted = this.onAutoplayStarted.bind(this);
     this.onPlayerTurnActivated = this.onPlayerTurnActivated.bind(this);
     this.onUnitAddedToMap = this.onUnitAddedToMap.bind(this);
+    this.onUnitAddedToArmy = this.onUnitAddedToArmy.bind(this);
+    this.onUnitRemovedFromArmy = this.onUnitRemovedFromArmy.bind(this);
+    this.onUnitRemovedFromMap = this.onUnitRemovedFromMap.bind(this);
     this.onUnitExperienceChanged = this.onUnitExperienceChanged.bind(this);
     this.onUnitPromoted = this.onUnitPromoted.bind(this);
     this.onUnitCommandStarted = this.onUnitCommandStarted.bind(this);
@@ -96,8 +150,11 @@ export const Actions = new (class {
       // Queue autoplay for 25 turns.
       "autoplay-25": this.startAutoplay(25),
 
-      // Spend every available promotion and commendation on the selected commander.
+      // Spend every available promotion, commendation, and army upgrade across all commanders.
       "upgrade-commander": this.upgradeSelectedCommander,
+
+      // Assign every currently reinforceable unit to a valid commander plot.
+      "reinforce-all-units": this.reinforceAllAvailableUnits,
 
       // Give the player gold.
       "add-gold": this.addGold,
@@ -183,7 +240,11 @@ export const Actions = new (class {
 
   // Return a safe array of units so bulk unit actions can iterate without guards.
   getLocalUnits() {
-    return this.getLocalPlayer()?.Units?.getUnits?.() ?? [];
+    const unitIds = this.getLocalPlayer()?.Units?.getUnitIds?.() ?? [];
+
+    return unitIds
+      .map((unitId) => Units.get(unitId))
+      .filter((unit) => unit !== null && unit !== undefined);
   }
 
   // Read the currently selected unit ID if one exists.
@@ -241,6 +302,49 @@ export const Actions = new (class {
     return this.getCommanderForUnit(this.getSelectedUnit());
   }
 
+  // Find the dev-panel status line for commander/admin tasks.
+  getCommanderStatusElement() {
+    return document.querySelector(".dev-panel-status--commanders");
+  }
+
+  // Update the commander/admin status line shown in the panel.
+  setCommanderStatus(message) {
+    const element = this.getCommanderStatusElement();
+
+    if (!element) {
+      return;
+    }
+
+    element.textContent = message;
+  }
+
+  // Restore the default commander/admin status text after a short delay.
+  scheduleCommanderStatusReset(delay = 2500) {
+    if (this.commanderStatusResetTimer) {
+      clearTimeout(this.commanderStatusResetTimer);
+    }
+
+    this.commanderStatusResetTimer = setTimeout(() => {
+      this.commanderStatusResetTimer = null;
+      this.setCommanderStatus("Commanders: ready");
+    }, delay);
+  }
+
+  // Re-select the current unit so panels and stats refresh after a manual admin action completes.
+  refreshSelectedUnitUI() {
+    const selectedUnitId = this.getSelectedUnitId();
+
+    if (!selectedUnitId || !Units.get(selectedUnitId)) {
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      if (Units.get(selectedUnitId)) {
+        UI.Player.selectUnit(selectedUnitId);
+      }
+    });
+  }
+
   // Register the autoplay/admin listeners exactly once.
   registerCommanderAdminListeners() {
     if (this.commanderAdminListenersRegistered) {
@@ -251,6 +355,9 @@ export const Actions = new (class {
     engine.on("AutoplayStarted", this.onAutoplayStarted, this);
     engine.on("PlayerTurnActivated", this.onPlayerTurnActivated, this);
     engine.on("UnitAddedToMap", this.onUnitAddedToMap, this);
+    engine.on("UnitAddedToArmy", this.onUnitAddedToArmy, this);
+    engine.on("UnitRemovedFromArmy", this.onUnitRemovedFromArmy, this);
+    engine.on("UnitRemovedFromMap", this.onUnitRemovedFromMap, this);
     engine.on("UnitExperienceChanged", this.onUnitExperienceChanged, this);
     engine.on("UnitPromoted", this.onUnitPromoted, this);
     engine.on("UnitCommandStarted", this.onUnitCommandStarted, this);
@@ -316,7 +423,7 @@ export const Actions = new (class {
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
         this.commanderAdminRefreshScheduled = false;
-        this.processCommanderAdminQueue();
+        this.processAdminQueues();
       });
     });
   }
@@ -328,6 +435,269 @@ export const Actions = new (class {
       Y: -9999,
       UnitAbilityType: -1,
     };
+  }
+
+  // Check whether a component ID already exists inside a small in-memory list.
+  isComponentIdInList(componentIds, componentId) {
+    return componentIds.some((candidate) =>
+      this.isSameComponentId(candidate, componentId),
+    );
+  }
+
+  // Extract the most relevant unit ID from a generic engine event payload.
+  getEventUnitId(data) {
+    return data?.initiatingUnit ?? data?.unit ?? null;
+  }
+
+  // Count how many commanders still have an upgrade, commendation, or army upgrade available.
+  getCommandersWithAdminActionsCount() {
+    return this.getCommanderUnits().filter((commander) =>
+      Boolean(this.getNextCommanderAdminAction(commander)),
+    ).length;
+  }
+
+  // Count how many local non-commander units can currently reinforce into a commander.
+  getReinforceableUnitsCount() {
+    return this.getLocalUnits().filter((unit) => {
+      if (!unit || unit.isCommanderUnit) {
+        return false;
+      }
+
+      return Boolean(
+        Game.UnitOperations?.canStart(
+          unit.id,
+          "UNITOPERATION_REINFORCE_ARMY",
+          {},
+          false,
+        )?.Success,
+      );
+    }).length;
+  }
+
+  // Keep the commander/admin status line in sync while a manual action is running.
+  updateManualAdminStatus() {
+    if (this.manualReinforcementRequested) {
+      const remainingUnits = this.getReinforceableUnitsCount();
+      this.setCommanderStatus(
+        remainingUnits > 0
+          ? `Reinforcing units… ${remainingUnits} still available`
+          : "Reinforcing units…",
+      );
+      return;
+    }
+
+    if (this.manualCommanderUpgradeRequested) {
+      const remainingCommanders = this.getCommandersWithAdminActionsCount();
+      this.setCommanderStatus(
+        remainingCommanders > 0
+          ? `Upgrading commanders… ${remainingCommanders} still need actions`
+          : "Upgrading commanders…",
+      );
+      return;
+    }
+
+    this.setCommanderStatus("Commanders: ready");
+  }
+
+  // Finalize the visible status when a manual commander/admin sweep becomes idle.
+  finishManualAdminStatusIfIdle() {
+    if (
+      this.reinforcementSweepRequested ||
+      this.reinforcementInFlight ||
+      this.commanderAdminInFlight ||
+      this.commanderAdminQueue.length > 0
+    ) {
+      this.updateManualAdminStatus();
+      return;
+    }
+
+    if (this.manualReinforcementRequested && this.manualCommanderUpgradeRequested) {
+      this.manualReinforcementRequested = false;
+      this.manualCommanderUpgradeRequested = false;
+      this.setCommanderStatus("Commander tasks finished.");
+      console.log("Dev panel: commander tasks finished.");
+      this.refreshSelectedUnitUI();
+      this.scheduleCommanderStatusReset();
+      return;
+    }
+
+    if (this.manualReinforcementRequested) {
+      this.manualReinforcementRequested = false;
+      this.setCommanderStatus("Reinforcement sweep finished.");
+      console.log("Dev panel: reinforcement sweep finished.");
+      this.refreshSelectedUnitUI();
+      this.scheduleCommanderStatusReset();
+      return;
+    }
+
+    if (this.manualCommanderUpgradeRequested) {
+      this.manualCommanderUpgradeRequested = false;
+      this.setCommanderStatus("Commander upgrades finished.");
+      console.log("Dev panel: commander upgrade sweep finished.");
+      this.refreshSelectedUnitUI();
+      this.scheduleCommanderStatusReset();
+      return;
+    }
+
+    this.setCommanderStatus("Commanders: ready");
+  }
+
+  // Score one reinforce target so the sweep can prefer the closest valid commander plot.
+  getReinforcementScore(unitId, targetPlot) {
+    const pathToCommander = Units.getPathTo?.(unitId, targetPlot);
+    const turns = Array.isArray(pathToCommander?.turns)
+      ? Math.max(...pathToCommander.turns, 0)
+      : 0;
+    const steps = Array.isArray(pathToCommander?.plots)
+      ? pathToCommander.plots.length
+      : 0;
+
+    return turns * 1000 + steps;
+  }
+
+  // Pick the best valid reinforce plot for a unit from the engine-provided plot list.
+  getBestReinforcementPlot(unitId, plotIndexes) {
+    let bestPlot = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    plotIndexes.forEach((plotIndex) => {
+      const targetPlot = GameplayMap.getLocationFromIndex(plotIndex);
+
+      if (!targetPlot) {
+        return;
+      }
+
+      const score = this.getReinforcementScore(unitId, targetPlot);
+
+      if (bestPlot === null || score < bestScore) {
+        bestPlot = targetPlot;
+        bestScore = score;
+      }
+    });
+
+    return bestPlot;
+  }
+
+  // Find the next unit that can currently reinforce into any eligible commander.
+  getNextReinforcementAction(skippedUnitIds = []) {
+    let bestAction = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (const unit of this.getLocalUnits()) {
+      if (
+        !unit ||
+        unit.isCommanderUnit ||
+        this.isComponentIdInList(skippedUnitIds, unit.id)
+      ) {
+        continue;
+      }
+
+      const result = Game.UnitOperations?.canStart(
+        unit.id,
+        "UNITOPERATION_REINFORCE_ARMY",
+        {},
+        false,
+      );
+
+      if (!result?.Success || !result.Plots?.length) {
+        continue;
+      }
+
+      // We intentionally do not hardcode any slot or stack limit here.
+      // The engine already knows the current free-space and same-slot stacking rules.
+      const targetPlot = this.getBestReinforcementPlot(unit.id, result.Plots);
+
+      if (!targetPlot) {
+        continue;
+      }
+
+      const score = this.getReinforcementScore(unit.id, targetPlot);
+
+      if (bestAction === null || score < bestScore) {
+        bestAction = {
+          unitId: unit.id,
+          targetPlot,
+        };
+        bestScore = score;
+
+        if (score === 0) {
+          return bestAction;
+        }
+      }
+    }
+
+    return bestAction;
+  }
+
+  // Send one reinforce request for a unit to the chosen commander plot.
+  sendReinforcementRequest(unitId, targetPlot) {
+    const result = Game.UnitOperations?.canStart(
+      unitId,
+      "UNITOPERATION_REINFORCE_ARMY",
+      {},
+      false,
+    );
+    const targetPlotIndex = GameplayMap.getIndexFromLocation(targetPlot);
+
+    if (!result?.Success || !result.Plots?.includes(targetPlotIndex)) {
+      return false;
+    }
+
+    Game.UnitOperations?.sendRequest(unitId, "UNITOPERATION_REINFORCE_ARMY", {
+      X: targetPlot.x,
+      Y: targetPlot.y,
+    });
+
+    // Fall back to a delayed refresh in case no immediate engine event fires.
+    setTimeout(() => {
+      if (this.isSameComponentId(this.reinforcementInFlight?.unitId, unitId)) {
+        this.reinforcementInFlight = null;
+        this.scheduleCommanderAdminProcessing();
+      }
+    }, 400);
+
+    return true;
+  }
+
+  // Consume any pending reinforce-all work before moving on to commander admin actions.
+  processAdminQueues() {
+    if (this.reinforcementInFlight || this.commanderAdminInFlight) {
+      this.updateManualAdminStatus();
+      return;
+    }
+
+    if (this.reinforcementSweepRequested) {
+      const skippedUnitIds = [];
+
+      while (this.reinforcementSweepRequested) {
+        const nextReinforcement = this.getNextReinforcementAction(skippedUnitIds);
+
+        if (!nextReinforcement) {
+          this.reinforcementSweepRequested = false;
+          break;
+        }
+
+        this.reinforcementInFlight = {
+          unitId: nextReinforcement.unitId,
+        };
+
+        if (
+          this.sendReinforcementRequest(
+            nextReinforcement.unitId,
+            nextReinforcement.targetPlot,
+          )
+        ) {
+          this.updateManualAdminStatus();
+          return;
+        }
+
+        skippedUnitIds.push(nextReinforcement.unitId);
+        this.reinforcementInFlight = null;
+      }
+    }
+
+    this.processCommanderAdminQueue();
+    this.finishManualAdminStatusIfIdle();
   }
 
   // Group each promotion by its prerequisites so we can calculate a stable tree depth.
@@ -559,7 +929,7 @@ export const Actions = new (class {
 
   // Drain the commander admin queue one safe request at a time.
   processCommanderAdminQueue() {
-    if (this.commanderAdminInFlight) {
+    if (this.reinforcementInFlight || this.commanderAdminInFlight) {
       return;
     }
 
@@ -592,30 +962,68 @@ export const Actions = new (class {
           : this.sendCommanderCommand(commander.id, nextAction.commandType);
 
       if (didStart) {
+        this.updateManualAdminStatus();
         return;
       }
 
       this.commanderAdminInFlight = null;
       this.commanderAdminQueue.shift();
     }
+
+    this.finishManualAdminStatusIfIdle();
   }
 
   // Queue every commander for a full admin sweep during autoplay.
   runAutoplayAdminTasks() {
+    this.reinforcementSweepRequested = true;
     this.enqueueAllCommandersForAdmin();
-    this.processCommanderAdminQueue();
+    this.processAdminQueues();
   }
 
-  // Queue the selected commander and spend all available promotion and commendation points.
-  upgradeSelectedCommander() {
-    const commander = this.getSelectedCommander();
+  // Queue every currently reinforceable unit and let the engine assign them to valid commanders.
+  reinforceAllAvailableUnits() {
+    const reinforceableUnits = this.getReinforceableUnitsCount();
 
-    if (!commander) {
+    if (reinforceableUnits <= 0) {
+      this.setCommanderStatus("No units can reinforce right now.");
+      console.log("Dev panel: no units can reinforce right now.");
+      this.scheduleCommanderStatusReset();
       return;
     }
 
-    this.enqueueCommanderForAdmin(commander.id);
-    this.processCommanderAdminQueue();
+    this.manualReinforcementRequested = true;
+    this.reinforcementSweepRequested = true;
+    this.setCommanderStatus(`Reinforcing units… ${reinforceableUnits} still available`);
+    console.log(`Dev panel: reinforcing ${reinforceableUnits} available unit(s).`);
+    this.processAdminQueues();
+  }
+
+  // Queue every commander that can currently spend promotions, commendations, or army upgrades.
+  upgradeSelectedCommander() {
+    const commandersWithActions = this.getCommanderUnits().filter((commander) =>
+      Boolean(this.getNextCommanderAdminAction(commander)),
+    );
+
+    if (commandersWithActions.length <= 0) {
+      this.setCommanderStatus("No commanders have upgrades available.");
+      console.log("Dev panel: no commanders have upgrades available.");
+      this.scheduleCommanderStatusReset();
+      return;
+    }
+
+    this.manualCommanderUpgradeRequested = true;
+    this.setCommanderStatus(
+      `Upgrading commanders… ${commandersWithActions.length} still need actions`,
+    );
+    console.log(
+      `Dev panel: upgrading ${commandersWithActions.length} commander(s).`,
+    );
+
+    commandersWithActions.forEach((commander) => {
+      this.enqueueCommanderForAdmin(commander.id);
+    });
+
+    this.processAdminQueues();
   }
 
   // Start a fresh autoplay admin sweep when autoplay begins.
@@ -639,15 +1047,91 @@ export const Actions = new (class {
     const localPlayerId = this.getLocalPlayerId();
     const unit = Units.get(data.unit) ?? data.unit;
 
-    if (!Autoplay.isActive || localPlayerId === null) {
+    if (localPlayerId === null) {
       return;
     }
 
-    if (!unit?.isCommanderUnit || unit.owner !== localPlayerId) {
+    if (!unit || unit.owner !== localPlayerId) {
       return;
     }
 
-    this.enqueueCommanderForAdmin(unit.id);
+    if (!Autoplay.isActive && !this.reinforcementSweepRequested) {
+      return;
+    }
+
+    if (Autoplay.isActive) {
+      // New local units may be reinforceable immediately.
+      this.reinforcementSweepRequested = true;
+    }
+
+    if (unit.isCommanderUnit) {
+      this.enqueueCommanderForAdmin(unit.id);
+    }
+
+    this.scheduleCommanderAdminProcessing();
+  }
+
+  // Continue a reinforce-all sweep when a unit is successfully added to an army.
+  onUnitAddedToArmy(data) {
+    const localPlayerId = this.getLocalPlayerId();
+    const unitId = this.getEventUnitId(data);
+    const unit = Units.get(unitId) ?? data?.unit ?? data?.initiatingUnit ?? null;
+
+    if (
+      localPlayerId === null ||
+      !unit ||
+      unit.owner !== localPlayerId ||
+      (!Autoplay.isActive &&
+        !this.reinforcementSweepRequested &&
+        !this.isSameComponentId(this.reinforcementInFlight?.unitId, unit.id))
+    ) {
+      return;
+    }
+
+    if (this.isSameComponentId(this.reinforcementInFlight?.unitId, unit.id)) {
+      this.reinforcementInFlight = null;
+    }
+
+    this.reinforcementSweepRequested = true;
+    this.scheduleCommanderAdminProcessing();
+  }
+
+  // Continue a reinforce-all sweep when a unit starts traveling to its commander off-map.
+  onUnitRemovedFromMap(data) {
+    const localPlayerId = this.getLocalPlayerId();
+    const unitId = this.getEventUnitId(data);
+    const unit = Units.get(unitId) ?? data?.unit ?? null;
+
+    if (
+      localPlayerId === null ||
+      !unit ||
+      unit.owner !== localPlayerId ||
+      (!Autoplay.isActive &&
+        !this.reinforcementSweepRequested &&
+        !this.isSameComponentId(this.reinforcementInFlight?.unitId, unit.id))
+    ) {
+      return;
+    }
+
+    if (this.isSameComponentId(this.reinforcementInFlight?.unitId, unit.id)) {
+      this.reinforcementInFlight = null;
+    }
+
+    this.reinforcementSweepRequested = true;
+    this.scheduleCommanderAdminProcessing();
+  }
+
+  // Re-run the reinforce sweep when autoplay frees a slot by removing a unit from an army.
+  onUnitRemovedFromArmy(data) {
+    const localPlayerId = this.getLocalPlayerId();
+    const unitId = this.getEventUnitId(data);
+    const unit = Units.get(unitId) ?? data?.unit ?? data?.initiatingUnit ?? null;
+
+    if (!Autoplay.isActive || localPlayerId === null || !unit || unit.owner !== localPlayerId) {
+      return;
+    }
+
+    this.reinforcementSweepRequested = true;
     this.scheduleCommanderAdminProcessing();
   }
 
@@ -693,6 +1177,7 @@ export const Actions = new (class {
       this.commanderAdminInFlight = null;
     }
 
+    this.reinforcementSweepRequested = true;
     this.enqueueCommanderForAdmin(unit.id);
     this.scheduleCommanderAdminProcessing();
   }
@@ -722,6 +1207,7 @@ export const Actions = new (class {
       this.commanderAdminInFlight = null;
     }
 
+    this.reinforcementSweepRequested = true;
     this.enqueueCommanderForAdmin(unit.id);
     this.scheduleCommanderAdminProcessing();
   }
@@ -737,12 +1223,22 @@ export const Actions = new (class {
         return;
       }
 
+      const tooltip = this.buttonTooltips[key];
+
+      if (tooltip) {
+        button.setAttribute("data-tooltip-content", tooltip);
+        button.setAttribute("data-tooltip-anchor", "top");
+        button.setAttribute("title", tooltip);
+      }
+
       // Remove any previous registration so reopening the panel does not stack handlers.
       button.removeEventListener("action-activate", callback);
 
       // Attach the handler that will run when the button is activated.
       button.addEventListener("action-activate", callback);
     });
+
+    this.finishManualAdminStatusIfIdle();
   }
 
   updateFontSize(value = 0) {
