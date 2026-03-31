@@ -28,14 +28,41 @@ export const Actions = new (class {
   manualReinforcementTotal = 0;
   manualReinforcementProcessed = 0;
 
+  // Track how many queued reinforcement attempts actually succeeded.
+  manualReinforcementSucceeded = 0;
+
+  // Track how many queued reinforcement attempts were skipped or became invalid.
+  manualReinforcementSkipped = 0;
+
   // Track whether the user manually kicked off a commander-upgrade sweep.
   manualCommanderUpgradeRequested = false;
+
+  // Track how many commanders were in the visible manual upgrade batch.
+  manualCommanderUpgradeTotal = 0;
+
+  // Track how many commanders have fully finished in the visible manual upgrade batch.
+  manualCommanderUpgradeCompleted = 0;
+
+  // Track how many individual promotion / army-upgrade requests were sent manually.
+  manualCommanderActionsSent = 0;
+
+  // Track the commanders that still belong to the visible manual upgrade batch.
+  manualCommanderPendingIds = [];
+
+  // Track the commander currently being worked on for status text and logs.
+  manualCommanderCurrentName = "";
 
   // Track whether the user manually kicked off a reinforce-all sweep.
   manualReinforcementRequested = false;
 
   // Store the timer used to restore the idle status text after a completion message.
   commanderStatusResetTimer = null;
+
+  // Track transient retries so commander automation can wait for gamecore without stalling forever.
+  commanderAdminRetryCounts = new Map();
+
+  // Prevent multiple attribute-screen refresh pop/push cycles from stacking.
+  attributeTreeRefreshScheduled = false;
 
   // Short hover summaries for the dev-panel buttons.
   buttonTooltips = {
@@ -53,7 +80,7 @@ export const Actions = new (class {
     "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or army upgrades.",
     "reinforce-all-units": "Send every eligible land, sea, and air unit to a valid commander.",
     "toggle-infinite-movement": "Toggle infinite movement for your units.",
-    "heal-units": "Heal every local unit, including packed and traveling units when possible.",
+    "heal-units": "Heal every alive player's unit, including packed and traveling units when possible.",
     "add-xp": "Grant 10,000,000 XP to every local unit.",
     "sleep-all-units": "Put every local unit to sleep.",
     "complete-tech": "Finish the active technology.",
@@ -75,6 +102,9 @@ export const Actions = new (class {
 
   // Prevent multiple delayed refreshes from piling up at once.
   commanderAdminRefreshScheduled = false;
+
+  // Track a unique token for each in-flight commander admin step so stale timers can be ignored safely.
+  commanderAdminActionSequence = 0;
 
   // Make sure engine listeners are registered only once.
   commanderAdminListenersRegistered = false;
@@ -257,6 +287,43 @@ export const Actions = new (class {
       .filter((unit) => unit !== null && unit !== undefined);
   }
 
+  // Return a safe array of units for one specific player.
+  getUnitsForPlayer(playerId) {
+    const player = Players.get(playerId);
+    const unitIds = player?.Units?.getUnitIds?.() ?? [];
+
+    return unitIds
+      .map((unitId) => Units.get(unitId))
+      .filter((unit) => unit !== null && unit !== undefined);
+  }
+
+  // Return a deduplicated safe array of units for every alive player.
+  getAllPlayerUnits() {
+    const unitsByKey = new Map();
+
+    for (const playerId of Players.getAliveIds?.() ?? []) {
+      for (const unit of this.getUnitsForPlayer(playerId)) {
+        const key = this.getComponentIdKey(unit.id);
+
+        if (!key) {
+          continue;
+        }
+
+        unitsByKey.set(key, unit);
+      }
+    }
+
+    return [...unitsByKey.values()];
+  }
+
+  // Reset the visible progress state for a manual reinforce-all sweep.
+  resetManualReinforcementProgress() {
+    this.manualReinforcementTotal = 0;
+    this.manualReinforcementProcessed = 0;
+    this.manualReinforcementSucceeded = 0;
+    this.manualReinforcementSkipped = 0;
+  }
+
   // Read the currently selected unit ID if one exists.
   getSelectedUnitId() {
     const selectedUnitId = UI.Player.getHeadSelectedUnit?.();
@@ -355,6 +422,21 @@ export const Actions = new (class {
     });
   }
 
+  // Make one unit the active local selection so stock unit-command paths have the same context as manual clicks.
+  ensureUnitSelected(unitId) {
+    if (!ComponentID.isValid(unitId)) {
+      return;
+    }
+
+    const selectedUnitId = this.getSelectedUnitId();
+
+    if (this.isSameComponentId(selectedUnitId, unitId)) {
+      return;
+    }
+
+    UI.Player.selectUnit?.(unitId);
+  }
+
   // Register the autoplay/admin listeners exactly once.
   registerCommanderAdminListeners() {
     if (this.commanderAdminListenersRegistered) {
@@ -410,6 +492,11 @@ export const Actions = new (class {
     this.commanderAdminQueue = this.commanderAdminQueue.filter((unitId) => {
       const commander = Units.get(unitId);
 
+      if (!commander?.isCommanderUnit || commander.owner !== localPlayerId) {
+        this.resetCommanderRetryCount(unitId);
+        this.markManualCommanderComplete(unitId);
+      }
+
       return Boolean(
         commander?.isCommanderUnit && commander.owner === localPlayerId,
       );
@@ -434,6 +521,193 @@ export const Actions = new (class {
       this.commanderAdminRefreshScheduled = false;
       this.processAdminQueues();
     });
+  }
+
+  // Build a stable string key for one component ID so tiny lookup maps can track retries safely.
+  getComponentIdKey(componentId) {
+    if (!ComponentID.isValid(componentId)) {
+      return "";
+    }
+
+    try {
+      return JSON.stringify(componentId) ?? String(componentId);
+    } catch (_error) {
+      return String(componentId);
+    }
+  }
+
+  // Resolve a readable unit name for status text and console logs.
+  getUnitDisplayName(unitOrId) {
+    const unit = ComponentID.isValid(unitOrId) ? Units.get(unitOrId) : unitOrId;
+
+    if (!unit) {
+      return "Commander";
+    }
+
+    if (typeof unit.name === "string" && unit.name.length > 0) {
+      return unit.name;
+    }
+
+    const unitDefinition = GameInfo.Units.lookup(unit.type);
+
+    if (unitDefinition?.Name) {
+      return Locale.compose(unitDefinition.Name);
+    }
+
+    return unit.type ?? "Commander";
+  }
+
+  // Reset the visible progress state for the manual commander-upgrade action.
+  resetManualCommanderProgress() {
+    this.manualCommanderUpgradeTotal = 0;
+    this.manualCommanderUpgradeCompleted = 0;
+    this.manualCommanderActionsSent = 0;
+    this.manualCommanderPendingIds = [];
+    this.manualCommanderCurrentName = "";
+  }
+
+  // Start a fresh visible progress batch for the manual commander-upgrade action.
+  beginManualCommanderProgress(unitIds) {
+    this.manualCommanderUpgradeTotal = unitIds.length;
+    this.manualCommanderUpgradeCompleted = 0;
+    this.manualCommanderActionsSent = 0;
+    this.manualCommanderPendingIds = [...unitIds];
+    this.manualCommanderCurrentName = "";
+  }
+
+  // Mark one commander as fully finished inside the visible manual upgrade batch.
+  markManualCommanderComplete(unitId) {
+    const pendingIndex = this.manualCommanderPendingIds.findIndex((pendingUnitId) =>
+      this.isSameComponentId(pendingUnitId, unitId),
+    );
+
+    if (pendingIndex < 0) {
+      return;
+    }
+
+    this.manualCommanderPendingIds.splice(pendingIndex, 1);
+    this.manualCommanderUpgradeCompleted = Math.min(
+      this.manualCommanderUpgradeCompleted + 1,
+      this.manualCommanderUpgradeTotal,
+    );
+
+    if (this.manualCommanderPendingIds.length <= 0) {
+      this.manualCommanderCurrentName = "";
+    }
+  }
+
+  // Read the current leader-attribute point state so the dev-panel button can verify it worked.
+  captureAttributePointState(player = this.getLocalPlayer()) {
+    const identity = player?.Identity;
+    const availableByAttribute = [...GameInfo.Attributes].map((attribute) => ({
+      attributeType: attribute.AttributeType,
+      availablePoints: Number(
+        identity?.getAvailableAttributePoints?.(attribute.AttributeType) ?? 0,
+      ),
+    }));
+
+    return {
+      wildcardPoints: Number(identity?.getWildcardPoints?.() ?? 0),
+      totalAvailablePoints: availableByAttribute.reduce(
+        (sum, entry) => sum + entry.availablePoints,
+        0,
+      ),
+      availableByAttribute,
+    };
+  }
+
+  // Compare two leader-attribute point snapshots so we can tell whether the grant actually applied.
+  hasAttributePointStateChanged(beforeState, afterState) {
+    if (
+      beforeState.wildcardPoints !== afterState.wildcardPoints ||
+      beforeState.totalAvailablePoints !== afterState.totalAvailablePoints
+    ) {
+      return true;
+    }
+
+    return beforeState.availableByAttribute.some(
+      (entry, index) =>
+        entry.attributeType !== afterState.availableByAttribute[index]?.attributeType ||
+        entry.availablePoints !== afterState.availableByAttribute[index]?.availablePoints,
+    );
+  }
+
+  // Nudge the stock leader-attribute screen onto a real node so wildcard points become immediately spendable.
+  primeAttributeTreeSelection() {
+    const firstAttributeCard = document.querySelector(
+      ".screen-attribute-trees attribute-card.available .hitbox[type], .screen-attribute-trees attribute-card .hitbox[type]",
+    );
+
+    if (!(firstAttributeCard instanceof HTMLElement)) {
+      return;
+    }
+
+    firstAttributeCard.dispatchEvent(new Event("mouseenter"));
+    firstAttributeCard.dispatchEvent(new Event("focus"));
+    firstAttributeCard.focus?.();
+  }
+
+  // Refresh the stock leader-attribute screen if it is already open so new wildcard points are usable immediately.
+  refreshAttributeTreeUi() {
+    if (this.attributeTreeRefreshScheduled) {
+      return;
+    }
+
+    const attributeTreeIsOpen =
+      ContextManager.hasInstanceOf?.("screen-attribute-trees") ??
+      Boolean(document.querySelector(".screen-attribute-trees"));
+
+    if (!attributeTreeIsOpen) {
+      return;
+    }
+
+    this.attributeTreeRefreshScheduled = true;
+
+    requestAnimationFrame(() => {
+      try {
+        ContextManager.pop("screen-attribute-trees");
+      } catch (_error) {
+        // Ignore and still try to reopen / reselect below.
+      }
+
+      requestAnimationFrame(() => {
+        try {
+          ContextManager.push("screen-attribute-trees");
+        } catch (_error) {
+          // Ignore and still try to select a real node if the screen remained mounted.
+        }
+
+        requestAnimationFrame(() => {
+          this.attributeTreeRefreshScheduled = false;
+          this.primeAttributeTreeSelection();
+        });
+      });
+    });
+  }
+
+  // Forget the retry counter for a commander once it advances successfully or leaves the queue.
+  resetCommanderRetryCount(unitId) {
+    const key = this.getComponentIdKey(unitId);
+
+    if (!key) {
+      return;
+    }
+
+    this.commanderAdminRetryCounts.delete(key);
+  }
+
+  // Increment the retry counter for a commander when gamecore still has not exposed the next step yet.
+  incrementCommanderRetryCount(unitId) {
+    const key = this.getComponentIdKey(unitId);
+
+    if (!key) {
+      return 0;
+    }
+
+    const nextRetryCount = (this.commanderAdminRetryCounts.get(key) ?? 0) + 1;
+
+    this.commanderAdminRetryCounts.set(key, nextRetryCount);
+    return nextRetryCount;
   }
 
   // Return the default command payload used by the stock unit-action UI for generic commands.
@@ -557,6 +831,126 @@ export const Actions = new (class {
     return this.commanderAdminQueue.length + (this.commanderAdminInFlight ? 1 : 0);
   }
 
+  // Build the ordered list of admin actions the current commander can legally try right now.
+  getCommanderAdminActions(commander) {
+    const actions = this.getCommanderPromotionCandidates(commander).map(
+      (candidate) => ({
+        kind: "promotion",
+        candidate,
+      }),
+    );
+
+    const upgradeArmyResult = Game.UnitCommands?.canStart(
+      commander.id,
+      "UNITCOMMAND_UPGRADE_ARMY",
+      this.getDefaultCommandArgs(),
+      false,
+    );
+
+    if (upgradeArmyResult?.Success) {
+      actions.push({
+        kind: "upgrade-army",
+        commandType: "UNITCOMMAND_UPGRADE_ARMY",
+      });
+    }
+
+    return actions;
+  }
+
+  // Build a stable signature for one commander admin action so progress checks can tell whether options changed.
+  getCommanderAdminActionSignature(action) {
+    if (!action) {
+      return "";
+    }
+
+    if (action.kind === "promotion") {
+      return `${action.kind}:${action.candidate.disciplineType}:${action.candidate.promotionType}`;
+    }
+
+    return `${action.kind}:${action.commandType ?? ""}`;
+  }
+
+  // Snapshot the commander promotion state so we can tell whether an admin request actually changed anything.
+  captureCommanderAdminState(commander, availableActions = null) {
+    const actions = availableActions ?? this.getCommanderAdminActions(commander);
+
+    return {
+      promotionPoints: Number(commander?.Experience?.getStoredPromotionPoints ?? 0),
+      commendationPoints: Number(commander?.Experience?.getStoredCommendations ?? 0),
+      canPromote: Boolean(commander?.Experience?.canPromote),
+      actionSignatures: actions.map((action) => this.getCommanderAdminActionSignature(action)),
+    };
+  }
+
+  // Compare two commander promotion snapshots to see whether the command actually advanced the unit.
+  hasCommanderAdminStateChanged(beforeState, afterState) {
+    if (
+      beforeState.promotionPoints !== afterState.promotionPoints ||
+      beforeState.commendationPoints !== afterState.commendationPoints ||
+      beforeState.canPromote !== afterState.canPromote
+    ) {
+      return true;
+    }
+
+    if (beforeState.actionSignatures.length !== afterState.actionSignatures.length) {
+      return true;
+    }
+
+    return beforeState.actionSignatures.some(
+      (signature, index) => signature !== afterState.actionSignatures[index],
+    );
+  }
+
+  // Poll the in-flight commander step until the unit state actually changes, instead of blindly re-sending the same command.
+  monitorCommanderAdminInFlight(token, delay = 200) {
+    setTimeout(() => {
+      const inFlight = this.commanderAdminInFlight;
+
+      if (!inFlight || inFlight.token !== token) {
+        return;
+      }
+
+      const commander = Units.get(inFlight.unitId);
+
+      if (!commander?.isCommanderUnit) {
+        this.commanderAdminInFlight = null;
+        this.scheduleCommanderAdminProcessing();
+        return;
+      }
+
+      const afterState = this.captureCommanderAdminState(commander);
+
+      if (this.hasCommanderAdminStateChanged(inFlight.beforeState, afterState)) {
+        this.commanderAdminInFlight = null;
+        this.resetCommanderRetryCount(commander.id);
+        this.enqueueCommanderForAdmin(commander.id);
+        this.scheduleCommanderAdminProcessing();
+        return;
+      }
+
+      const elapsed = Date.now() - inFlight.startedAt;
+
+      if (!inFlight.selectionRefreshed && elapsed >= 1200) {
+        inFlight.selectionRefreshed = true;
+        this.ensureUnitSelected(inFlight.unitId);
+      }
+
+      if (elapsed < 8000) {
+        this.monitorCommanderAdminInFlight(token, elapsed < 2000 ? 150 : 300);
+        return;
+      }
+
+      console.warn(
+        `Dev panel: commander ${this.getUnitDisplayName(commander)} did not change after ${inFlight.actionSignature}; abandoning that step.`,
+      );
+      this.commanderAdminInFlight = null;
+      this.commanderAdminQueue.shift();
+      this.resetCommanderRetryCount(commander.id);
+      this.markManualCommanderComplete(commander.id);
+      this.scheduleCommanderAdminProcessing();
+    }, delay);
+  }
+
   // Count how many local non-commander units can currently reinforce into a commander.
   getReinforceableUnitsCount() {
     return this.getLocalUnits().filter((unit) => {
@@ -580,24 +974,30 @@ export const Actions = new (class {
     if (this.manualReinforcementRequested) {
       const remainingUnits =
         this.reinforcementQueue.length + (this.reinforcementInFlight ? 1 : 0);
-      const completedUnits = Math.min(
-        this.manualReinforcementProcessed,
-        this.manualReinforcementTotal,
-      );
       this.setCommanderStatus(
         this.manualReinforcementTotal > 0
-          ? `Reinforcing units… ${completedUnits}/${this.manualReinforcementTotal} done, ${remainingUnits} left`
+          ? `Reinforcing units… ${this.manualReinforcementSucceeded} reinforced, ${this.manualReinforcementSkipped} skipped, ${remainingUnits} left to try`
           : "Reinforcing units…",
       );
       return;
     }
 
     if (this.manualCommanderUpgradeRequested) {
-      const remainingCommanders = this.getPendingCommanderQueueCount();
+      const remainingCommanders = this.manualCommanderPendingIds.length;
+      const completedCommanders = Math.min(
+        this.manualCommanderUpgradeCompleted,
+        this.manualCommanderUpgradeTotal,
+      );
+      const actionLabel =
+        this.manualCommanderActionsSent === 1 ? "action" : "actions";
+      const currentCommanderLabel = this.manualCommanderCurrentName
+        ? ` — ${this.manualCommanderCurrentName}`
+        : "";
+
       this.setCommanderStatus(
         remainingCommanders > 0
-          ? `Upgrading commanders… ${remainingCommanders} still need actions`
-          : "Upgrading commanders…",
+          ? `Upgrading commanders… ${completedCommanders}/${this.manualCommanderUpgradeTotal} done, ${remainingCommanders} left, ${this.manualCommanderActionsSent} ${actionLabel} sent${currentCommanderLabel}`
+          : "Upgrading commanders… finalizing"
       );
       return;
     }
@@ -607,21 +1007,21 @@ export const Actions = new (class {
 
   // Finalize the visible status when a manual commander/admin sweep becomes idle.
   finishManualAdminStatusIfIdle() {
-    if (
-      this.reinforcementSweepRequested ||
-      this.reinforcementInFlight ||
-      this.commanderAdminInFlight ||
-      this.commanderAdminQueue.length > 0
-    ) {
-      this.updateManualAdminStatus();
-      return;
-    }
-
     if (this.manualReinforcementRequested && this.manualCommanderUpgradeRequested) {
+      if (
+        this.reinforcementSweepRequested ||
+        this.reinforcementInFlight ||
+        this.commanderAdminInFlight ||
+        this.manualCommanderPendingIds.length > 0
+      ) {
+        this.updateManualAdminStatus();
+        return;
+      }
+
       this.manualReinforcementRequested = false;
       this.manualCommanderUpgradeRequested = false;
-      this.manualReinforcementProcessed = 0;
-      this.manualReinforcementTotal = 0;
+      this.resetManualReinforcementProgress();
+      this.resetManualCommanderProgress();
       this.setCommanderStatus("Commander tasks finished.");
       console.log("Dev panel: commander tasks finished.");
       this.refreshSelectedUnitUI();
@@ -630,22 +1030,44 @@ export const Actions = new (class {
     }
 
     if (this.manualReinforcementRequested) {
+      if (this.reinforcementSweepRequested || this.reinforcementInFlight) {
+        this.updateManualAdminStatus();
+        return;
+      }
+
+      const remainingEligibleUnits = this.getReinforceableUnitsCount();
       this.manualReinforcementRequested = false;
-      this.setCommanderStatus(
-        `Reinforcement sweep finished (${this.manualReinforcementProcessed}/${this.manualReinforcementTotal}).`,
-      );
-      console.log(
-        `Dev panel: reinforcement sweep finished (${this.manualReinforcementProcessed}/${this.manualReinforcementTotal}).`,
-      );
-      this.manualReinforcementProcessed = 0;
-      this.manualReinforcementTotal = 0;
+
+      if (remainingEligibleUnits > 0) {
+        this.setCommanderStatus(
+          `Reinforcement sweep paused (${this.manualReinforcementSucceeded} reinforced, ${this.manualReinforcementSkipped} skipped, ${remainingEligibleUnits} still eligible).`,
+        );
+        console.warn(
+          `Dev panel: reinforcement sweep paused (${this.manualReinforcementSucceeded} reinforced, ${this.manualReinforcementSkipped} skipped, ${remainingEligibleUnits} units still eligible).`,
+        );
+      } else {
+        this.setCommanderStatus(
+          `Reinforcement sweep finished (${this.manualReinforcementSucceeded} reinforced, ${this.manualReinforcementSkipped} skipped).`,
+        );
+        console.log(
+          `Dev panel: reinforcement sweep finished (${this.manualReinforcementSucceeded} reinforced, ${this.manualReinforcementSkipped} skipped).`,
+        );
+      }
+
+      this.resetManualReinforcementProgress();
       this.refreshSelectedUnitUI();
       this.scheduleCommanderStatusReset();
       return;
     }
 
     if (this.manualCommanderUpgradeRequested) {
+      if (this.commanderAdminInFlight || this.manualCommanderPendingIds.length > 0) {
+        this.updateManualAdminStatus();
+        return;
+      }
+
       this.manualCommanderUpgradeRequested = false;
+      this.resetManualCommanderProgress();
       this.setCommanderStatus("Commander upgrades finished.");
       console.log("Dev panel: commander upgrade sweep finished.");
       this.refreshSelectedUnitUI();
@@ -792,6 +1214,10 @@ export const Actions = new (class {
         this.manualReinforcementProcessed + 1,
         this.manualReinforcementTotal,
       );
+      this.manualReinforcementSucceeded = Math.min(
+        this.manualReinforcementSucceeded + 1,
+        this.manualReinforcementProcessed,
+      );
     }
   }
 
@@ -832,7 +1258,18 @@ export const Actions = new (class {
       return;
     }
 
-    if (this.reinforcementSweepRequested) {
+    const prioritizeCommanders =
+      this.manualCommanderUpgradeRequested && !this.manualReinforcementRequested;
+
+    if (prioritizeCommanders) {
+      this.processCommanderAdminQueue();
+
+      if (this.commanderAdminInFlight) {
+        return;
+      }
+    }
+
+    if (this.reinforcementSweepRequested && !prioritizeCommanders) {
       while (this.reinforcementQueue.length > 0) {
         const nextReinforcement = this.reinforcementQueue.shift();
         const refreshedReinforcement = this.getReinforcementActionForUnit(
@@ -844,6 +1281,10 @@ export const Actions = new (class {
             this.manualReinforcementProcessed = Math.min(
               this.manualReinforcementProcessed + 1,
               this.manualReinforcementTotal,
+            );
+            this.manualReinforcementSkipped = Math.min(
+              this.manualReinforcementSkipped + 1,
+              this.manualReinforcementProcessed,
             );
           }
 
@@ -871,13 +1312,20 @@ export const Actions = new (class {
             this.manualReinforcementProcessed + 1,
             this.manualReinforcementTotal,
           );
+          this.manualReinforcementSkipped = Math.min(
+            this.manualReinforcementSkipped + 1,
+            this.manualReinforcementProcessed,
+          );
         }
       }
 
       this.reinforcementSweepRequested = false;
     }
 
-    this.processCommanderAdminQueue();
+    if (!prioritizeCommanders) {
+      this.processCommanderAdminQueue();
+    }
+
     this.finishManualAdminStatusIfIdle();
   }
 
@@ -1049,34 +1497,13 @@ export const Actions = new (class {
 
   // Choose the next automatic commander admin action, prioritizing promotions and commendations first.
   getNextCommanderAdminAction(commander) {
-    const nextPromotion = this.getCommanderPromotionCandidates(commander)[0];
-
-    if (nextPromotion) {
-      return {
-        kind: "promotion",
-        candidate: nextPromotion,
-      };
-    }
-
-    const upgradeArmyResult = Game.UnitCommands?.canStart(
-      commander.id,
-      "UNITCOMMAND_UPGRADE_ARMY",
-      this.getDefaultCommandArgs(),
-      false,
-    );
-
-    if (upgradeArmyResult?.Success) {
-      return {
-        kind: "upgrade-army",
-        commandType: "UNITCOMMAND_UPGRADE_ARMY",
-      };
-    }
-
-    return null;
+    return this.getCommanderAdminActions(commander)[0] ?? null;
   }
 
   // Send a single promotion or commendation request to the game core.
   sendCommanderPromotion(unitId, candidate) {
+    this.ensureUnitSelected(unitId);
+
     const args = {
       PromotionType: Database.makeHash(candidate.promotionType),
       PromotionDisciplineType: Database.makeHash(candidate.disciplineType),
@@ -1094,11 +1521,14 @@ export const Actions = new (class {
     }
 
     Game.UnitCommands?.sendRequest(unitId, "UNITCOMMAND_PROMOTE", args);
+
     return true;
   }
 
   // Send a generic commander command such as "upgrade army".
   sendCommanderCommand(unitId, commandType) {
+    this.ensureUnitSelected(unitId);
+
     const args = this.getDefaultCommandArgs();
     const result = Game.UnitCommands?.canStart(unitId, commandType, args, false);
 
@@ -1107,18 +1537,6 @@ export const Actions = new (class {
     }
 
     Game.UnitCommands?.sendRequest(unitId, commandType, args);
-
-    // Use a fallback retry so queue progress does not depend entirely on one engine event.
-    setTimeout(() => {
-      if (
-        this.commanderAdminInFlight?.kind === "upgrade-army" &&
-        this.isSameComponentId(this.commanderAdminInFlight.unitId, unitId)
-      ) {
-        this.commanderAdminInFlight = null;
-        this.enqueueCommanderForAdmin(unitId);
-        this.scheduleCommanderAdminProcessing();
-      }
-    }, 400);
 
     return true;
   }
@@ -1137,33 +1555,91 @@ export const Actions = new (class {
 
       if (!commander?.isCommanderUnit) {
         this.commanderAdminQueue.shift();
+        this.resetCommanderRetryCount(commanderId);
+        this.markManualCommanderComplete(commanderId);
         continue;
       }
 
-      const nextAction = this.getNextCommanderAdminAction(commander);
+      const availableActions = this.getCommanderAdminActions(commander);
 
-      if (!nextAction) {
+      if (availableActions.length <= 0) {
         this.commanderAdminQueue.shift();
+        this.resetCommanderRetryCount(commander.id);
+        this.markManualCommanderComplete(commander.id);
+        console.log(
+          `Dev panel: commander ${this.getUnitDisplayName(commander)} finished upgrading.`,
+        );
         continue;
       }
 
-      this.commanderAdminInFlight = {
-        kind: nextAction.kind,
-        unitId: commander.id,
-      };
+      this.manualCommanderCurrentName = this.getUnitDisplayName(commander);
+      const beforeState = this.captureCommanderAdminState(
+        commander,
+        availableActions,
+      );
 
-      const didStart =
-        nextAction.kind === "promotion"
-          ? this.sendCommanderPromotion(commander.id, nextAction.candidate)
-          : this.sendCommanderCommand(commander.id, nextAction.commandType);
+      for (const nextAction of availableActions) {
+        const token = ++this.commanderAdminActionSequence;
 
-      if (didStart) {
+        this.commanderAdminInFlight = {
+          kind: nextAction.kind,
+          unitId: commander.id,
+          token,
+          startedAt: Date.now(),
+          beforeState,
+          actionSignature: this.getCommanderAdminActionSignature(nextAction),
+          selectionRefreshed: false,
+        };
+
+        const didStart =
+          nextAction.kind === "promotion"
+            ? this.sendCommanderPromotion(commander.id, nextAction.candidate)
+            : this.sendCommanderCommand(commander.id, nextAction.commandType);
+
+        if (didStart) {
+          this.resetCommanderRetryCount(commander.id);
+
+          if (this.manualCommanderUpgradeRequested) {
+            this.manualCommanderActionsSent += 1;
+          }
+
+          console.log(
+            nextAction.kind === "promotion"
+              ? `Dev panel: commander ${this.manualCommanderCurrentName} -> ${nextAction.candidate.promotionType}.`
+              : `Dev panel: commander ${this.manualCommanderCurrentName} -> ${nextAction.commandType}.`,
+          );
+          this.monitorCommanderAdminInFlight(token);
+          this.updateManualAdminStatus();
+          return;
+        }
+
+        this.commanderAdminInFlight = null;
+      }
+
+      const retryCount = this.incrementCommanderRetryCount(commander.id);
+
+      if (retryCount <= 30) {
+        if (retryCount === 1 || retryCount % 10 === 0) {
+          console.log(
+            `Dev panel: waiting for commander ${this.manualCommanderCurrentName} to expose the next upgrade (${retryCount}).`,
+          );
+        }
+
         this.updateManualAdminStatus();
+
+        setTimeout(() => {
+          this.scheduleCommanderAdminProcessing();
+        }, 200);
+
         return;
       }
 
-      this.commanderAdminInFlight = null;
+      console.warn(
+        `Dev panel: dropping commander ${this.manualCommanderCurrentName} after repeated unavailable upgrade attempts.`,
+      );
       this.commanderAdminQueue.shift();
+      this.resetCommanderRetryCount(commander.id);
+      this.markManualCommanderComplete(commander.id);
     }
 
     this.finishManualAdminStatusIfIdle();
@@ -1182,8 +1658,7 @@ export const Actions = new (class {
 
     if (reinforceableUnits <= 0) {
       this.manualReinforcementRequested = false;
-      this.manualReinforcementProcessed = 0;
-      this.manualReinforcementTotal = 0;
+      this.resetManualReinforcementProgress();
       this.setCommanderStatus("No units can reinforce right now.");
       console.log("Dev panel: no units can reinforce right now.");
       this.scheduleCommanderStatusReset();
@@ -1193,7 +1668,9 @@ export const Actions = new (class {
     this.manualReinforcementRequested = true;
     this.manualReinforcementTotal = reinforceableUnits;
     this.manualReinforcementProcessed = 0;
-    this.setCommanderStatus(`Reinforcing units… 0/${reinforceableUnits} done, ${reinforceableUnits} left`);
+    this.manualReinforcementSucceeded = 0;
+    this.manualReinforcementSkipped = 0;
+    this.setCommanderStatus(`Reinforcing units… 0 reinforced, 0 skipped, ${reinforceableUnits} left to try`);
     console.log(`Dev panel: reinforcing ${reinforceableUnits} available unit(s).`);
     this.processAdminQueues();
   }
@@ -1205,6 +1682,8 @@ export const Actions = new (class {
     );
 
     if (commandersWithActions.length <= 0) {
+      this.manualCommanderUpgradeRequested = false;
+      this.resetManualCommanderProgress();
       this.setCommanderStatus("No commanders have upgrades available.");
       console.log("Dev panel: no commanders have upgrades available.");
       this.scheduleCommanderStatusReset();
@@ -1212,8 +1691,11 @@ export const Actions = new (class {
     }
 
     this.manualCommanderUpgradeRequested = true;
+    this.beginManualCommanderProgress(
+      commandersWithActions.map((commander) => commander.id),
+    );
     this.setCommanderStatus(
-      `Upgrading commanders… ${commandersWithActions.length} still need actions`,
+      `Upgrading commanders… 0/${commandersWithActions.length} done, ${commandersWithActions.length} left, 0 actions sent`,
     );
     console.log(
       `Dev panel: upgrading ${commandersWithActions.length} commander(s).`,
@@ -1373,6 +1855,7 @@ export const Actions = new (class {
       this.commanderAdminInFlight = null;
     }
 
+    this.resetCommanderRetryCount(unit.id);
     this.enqueueCommanderForAdmin(unit.id);
     this.scheduleCommanderAdminProcessing();
   }
@@ -1401,6 +1884,8 @@ export const Actions = new (class {
     if (this.isSameComponentId(this.commanderAdminInFlight?.unitId, unit.id)) {
       this.commanderAdminInFlight = null;
     }
+
+    this.resetCommanderRetryCount(unit.id);
 
     if (Autoplay.isActive || this.manualReinforcementRequested || this.reinforcementSweepRequested) {
       this.replaceReinforcementQueue();
@@ -1672,8 +2157,47 @@ export const Actions = new (class {
   }
 
   addWildcardAttributePoint() {
-    // Add one wildcard attribute point if the identity subsystem is available.
-    this.getLocalPlayer()?.Identity?.addWildcardAttributePoints?.(100000);
+    // Resolve the local player once so we can both grant and verify the wildcard point change.
+    const player = this.getLocalPlayer();
+
+    // Abort early if the identity subsystem is unavailable.
+    if (!player?.Identity) {
+      return;
+    }
+
+    // Snapshot the current attribute point state so we can confirm the grant and refresh the stock UI correctly.
+    const beforeState = this.captureAttributePointState(player);
+
+    try {
+      // Grant exactly one wildcard point so the button matches its label and avoids absurd UI counts.
+      player.Identity.addWildcardAttributePoints?.(1);
+    } catch (_error) {
+      // Ignore and fall through to the verification / diagnostics below.
+    }
+
+    setTimeout(() => {
+      const currentPlayer = this.getLocalPlayer();
+      const afterState = this.captureAttributePointState(currentPlayer);
+
+      if (this.hasAttributePointStateChanged(beforeState, afterState)) {
+        console.log(
+          `Dev panel: wildcard attribute points changed (${beforeState.wildcardPoints} -> ${afterState.wildcardPoints}).`,
+        );
+        this.refreshAttributeTreeUi();
+        return;
+      }
+
+      const identityMethods = this.getCallablePropertyNames(currentPlayer?.Identity)
+        .filter((name) => /attribute|wildcard/i.test(name))
+        .slice(0, 20);
+
+      console.warn("Dev panel: wildcard attribute points did not change.", {
+        beforeState,
+        afterState,
+        identityMethods,
+      });
+      this.refreshAttributeTreeUi();
+    }, 50);
   }
 
   reloadUI() {
@@ -1892,9 +2416,9 @@ export const Actions = new (class {
   }
 
   healUnits() {
-    // Iterate over a safe unit list so this action does nothing instead of crashing.
-    for (const unit of this.getLocalUnits()) {
-      // Remove all damage from each unit.
+    // Iterate over every alive player's safe unit list so this action heals all player-owned units.
+    for (const unit of this.getAllPlayerUnits()) {
+      // Remove all damage from each player-owned unit.
       Units.setDamage(unit.id, 0);
     }
   }
