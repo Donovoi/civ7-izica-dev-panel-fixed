@@ -437,6 +437,90 @@ export const Actions = new (class {
     UI.Player.selectUnit?.(unitId);
   }
 
+  // Borrow the current unit selection for one stock command check/request and then hand it back.
+  withTemporaryUnitSelection(unitId, callback) {
+    if (!ComponentID.isValid(unitId) || typeof callback !== "function") {
+      return null;
+    }
+
+    const previousSelectionId = this.getSelectedUnitId();
+    const alreadySelected = this.isSameComponentId(previousSelectionId, unitId);
+
+    if (!alreadySelected) {
+      this.ensureUnitSelected(unitId);
+    }
+
+    if (!this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+      return null;
+    }
+
+    try {
+      return callback();
+    } finally {
+      if (alreadySelected) {
+        return;
+      }
+
+      requestAnimationFrame(() => {
+        if (!this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+          return;
+        }
+
+        if (previousSelectionId && Units.get(previousSelectionId)) {
+          UI.Player.selectUnit?.(previousSelectionId);
+        }
+      });
+    }
+  }
+
+  // Ask the stock command system whether a command can start, borrowing selection only when requested.
+  canStartUnitCommand(unitId, commandType, args, allowTemporarySelection = false) {
+    const directResult = Game.UnitCommands?.canStart(
+      unitId,
+      commandType,
+      args,
+      false,
+    );
+
+    if (directResult?.Success || !allowTemporarySelection) {
+      return directResult ?? null;
+    }
+
+    return (
+      this.withTemporaryUnitSelection(unitId, () =>
+        Game.UnitCommands?.canStart(unitId, commandType, args, false),
+      ) ?? directResult ?? null
+    );
+  }
+
+  // Send one stock unit command while minimizing how long automation owns the UI selection.
+  sendUnitCommand(unitId, commandType, args) {
+    const directResult = this.canStartUnitCommand(unitId, commandType, args);
+
+    if (directResult?.Success) {
+      Game.UnitCommands?.sendRequest(unitId, commandType, args);
+      return true;
+    }
+
+    return Boolean(
+      this.withTemporaryUnitSelection(unitId, () => {
+        const selectedResult = Game.UnitCommands?.canStart(
+          unitId,
+          commandType,
+          args,
+          false,
+        );
+
+        if (!selectedResult?.Success) {
+          return false;
+        }
+
+        Game.UnitCommands?.sendRequest(unitId, commandType, args);
+        return true;
+      }),
+    );
+  }
+
   // Register the autoplay/admin listeners exactly once.
   registerCommanderAdminListeners() {
     if (this.commanderAdminListenersRegistered) {
@@ -871,7 +955,7 @@ export const Actions = new (class {
   }
 
   // Build the ordered list of admin actions the current commander can legally try right now.
-  getCommanderAdminActions(commander) {
+  getCommanderAdminActions(commander, allowTemporarySelection = false) {
     const actions = this.getCommanderPromotionCandidates(commander).map(
       (candidate) => ({
         kind: "promotion",
@@ -879,11 +963,11 @@ export const Actions = new (class {
       }),
     );
 
-    const upgradeArmyResult = Game.UnitCommands?.canStart(
+    const upgradeArmyResult = this.canStartUnitCommand(
       commander.id,
       "UNITCOMMAND_UPGRADE_ARMY",
       this.getDefaultCommandArgs(),
-      false,
+      allowTemporarySelection,
     );
 
     if (upgradeArmyResult?.Success) {
@@ -910,9 +994,15 @@ export const Actions = new (class {
   }
 
   // Snapshot the commander promotion state so we can tell whether an admin request actually changed anything.
-  captureCommanderAdminState(commander, availableActions = null) {
-    const actions = availableActions ?? this.getCommanderAdminActions(commander);
+  captureCommanderAdminState(commander) {
     const experience = commander?.Experience;
+    const promotionSignatures = this.getCommanderPromotionCandidates(commander).map(
+      (candidate) =>
+        this.getCommanderAdminActionSignature({
+          kind: "promotion",
+          candidate,
+        }),
+    );
 
     return {
       promotionPoints: this.readNativeNumber(
@@ -924,22 +1014,8 @@ export const Actions = new (class {
         "getStoredCommendations",
       ),
       canPromote: this.readNativeBoolean(experience, "canPromote"),
-      actionSignatures: actions.map((action) => this.getCommanderAdminActionSignature(action)),
+      promotionSignatures,
     };
-  }
-
-  // Make sure one commander is really selected before asking the stock command system which upgrades are legal.
-  prepareCommanderForAdmin(unitId) {
-    if (!ComponentID.isValid(unitId)) {
-      return false;
-    }
-
-    if (this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
-      return true;
-    }
-
-    this.ensureUnitSelected(unitId);
-    return this.isSameComponentId(this.getSelectedUnitId(), unitId);
   }
 
   // Compare two commander promotion snapshots to see whether the command actually advanced the unit.
@@ -952,12 +1028,15 @@ export const Actions = new (class {
       return true;
     }
 
-    if (beforeState.actionSignatures.length !== afterState.actionSignatures.length) {
+    if (
+      beforeState.promotionSignatures.length !==
+      afterState.promotionSignatures.length
+    ) {
       return true;
     }
 
-    return beforeState.actionSignatures.some(
-      (signature, index) => signature !== afterState.actionSignatures[index],
+    return beforeState.promotionSignatures.some(
+      (signature, index) => signature !== afterState.promotionSignatures[index],
     );
   }
 
@@ -989,11 +1068,6 @@ export const Actions = new (class {
       }
 
       const elapsed = Date.now() - inFlight.startedAt;
-
-      if (!inFlight.selectionRefreshed && elapsed >= 1200) {
-        inFlight.selectionRefreshed = true;
-        this.ensureUnitSelected(inFlight.unitId);
-      }
 
       if (elapsed < 8000) {
         this.monitorCommanderAdminInFlight(token, elapsed < 2000 ? 150 : 300);
@@ -1572,43 +1646,17 @@ export const Actions = new (class {
 
   // Send a single promotion or commendation request to the game core.
   sendCommanderPromotion(unitId, candidate) {
-    this.ensureUnitSelected(unitId);
-
     const args = {
       PromotionType: Database.makeHash(candidate.promotionType),
       PromotionDisciplineType: Database.makeHash(candidate.disciplineType),
     };
 
-    const result = Game.UnitCommands?.canStart(
-      unitId,
-      "UNITCOMMAND_PROMOTE",
-      args,
-      false,
-    );
-
-    if (!result?.Success) {
-      return false;
-    }
-
-    Game.UnitCommands?.sendRequest(unitId, "UNITCOMMAND_PROMOTE", args);
-
-    return true;
+    return this.sendUnitCommand(unitId, "UNITCOMMAND_PROMOTE", args);
   }
 
   // Send a generic commander command such as "upgrade army".
   sendCommanderCommand(unitId, commandType) {
-    this.ensureUnitSelected(unitId);
-
-    const args = this.getDefaultCommandArgs();
-    const result = Game.UnitCommands?.canStart(unitId, commandType, args, false);
-
-    if (!result?.Success) {
-      return false;
-    }
-
-    Game.UnitCommands?.sendRequest(unitId, commandType, args);
-
-    return true;
+    return this.sendUnitCommand(unitId, commandType, this.getDefaultCommandArgs());
   }
 
   // Drain the commander admin queue one safe request at a time.
@@ -1632,13 +1680,7 @@ export const Actions = new (class {
 
       this.manualCommanderCurrentName = this.getUnitDisplayName(commander);
 
-      if (!this.prepareCommanderForAdmin(commander.id)) {
-        this.updateManualAdminStatus();
-        this.scheduleCommanderAdminProcessing();
-        return;
-      }
-
-      const availableActions = this.getCommanderAdminActions(commander);
+      const availableActions = this.getCommanderAdminActions(commander, true);
 
       if (availableActions.length <= 0) {
         this.commanderAdminQueue.shift();
@@ -1650,10 +1692,7 @@ export const Actions = new (class {
         continue;
       }
 
-      const beforeState = this.captureCommanderAdminState(
-        commander,
-        availableActions,
-      );
+      const beforeState = this.captureCommanderAdminState(commander);
 
       for (const nextAction of availableActions) {
         const token = ++this.commanderAdminActionSequence;
@@ -1665,7 +1704,6 @@ export const Actions = new (class {
           startedAt: Date.now(),
           beforeState,
           actionSignature: this.getCommanderAdminActionSignature(nextAction),
-          selectionRefreshed: false,
         };
 
         const didStart =
