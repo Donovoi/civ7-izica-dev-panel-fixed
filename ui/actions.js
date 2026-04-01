@@ -83,6 +83,9 @@ export const Actions = new (class {
   // Store the timer used to restore the idle progression status text after a completion message.
   progressionStatusResetTimer = null;
 
+  // Store the timer used to restore the idle empire status text after a one-click tune-up.
+  empireStatusResetTimer = null;
+
   // Track whether the player asked for the full tech-and-civic sweep.
   progressionAutomationRequested = false;
 
@@ -176,6 +179,7 @@ export const Actions = new (class {
     "toggle-fast-gameplay": "Toggle quick combat, quick movement, and notification camera panning for a snappier game flow.",
     "toggle-performance-profiler": "Toggle a lightweight frame-time profiler that reports UI stutters, records resumable session diagnostics, and keeps the console chatty in a helpful way.",
     "copy-all-logs": "Copy the current save's profiler session log and the mirrored dev console log to the clipboard so you can paste them into a text file for debugging.",
+    "run-empire-maintenance": "Run a one-click empire tune-up: top up economy, growth, happiness, healing, XP, reinforcements, military upgrades, and the full research/civic sweep.",
     "add-gold": "Grant 1,000,000 gold.",
     "add-influence": "Grant 1,000,000 influence.",
     "add-wildcard-attribute-point": "Grant 1 wildcard attribute point.",
@@ -243,6 +247,7 @@ export const Actions = new (class {
     this.togglePerformanceProfiler = this.togglePerformanceProfiler.bind(this);
     this.copyAllLogs = this.copyAllLogs.bind(this);
     this.clearAllLogs = this.clearAllLogs.bind(this);
+    this.runEmpireMaintenance = this.runEmpireMaintenance.bind(this);
     this.completeTech = this.completeTech.bind(this);
     this.completeCivic = this.completeCivic.bind(this);
     this.completeAllResearchAndCivics = this.completeAllResearchAndCivics.bind(this);
@@ -316,6 +321,9 @@ export const Actions = new (class {
 
       // Clear the mirrored dev console buffer and every stored profiler session log.
       "clear-all-logs": this.clearAllLogs,
+
+      // Launch the one-click empire maintenance pass.
+      "run-empire-maintenance": this.runEmpireMaintenance,
 
       // Toggle the cheat-assisted autoplay mastery helper.
       "toggle-autoplay-mastery": this.toggleAutoplayMastery,
@@ -632,6 +640,22 @@ export const Actions = new (class {
     element.textContent = message;
   }
 
+  // Find the dev-panel status line for one-click empire tune-ups.
+  getEmpireStatusElement() {
+    return document.querySelector(".dev-panel-status--empire");
+  }
+
+  // Update the empire status line shown in the panel.
+  setEmpireStatus(message) {
+    const element = this.getEmpireStatusElement();
+
+    if (!element) {
+      return;
+    }
+
+    element.textContent = message;
+  }
+
   // Restore the default commander/admin status text after a short delay.
   scheduleCommanderStatusReset(delay = 2500) {
     if (this.commanderStatusResetTimer) {
@@ -665,6 +689,18 @@ export const Actions = new (class {
     this.progressionStatusResetTimer = setTimeout(() => {
       this.progressionStatusResetTimer = null;
       this.setProgressionStatus("Progression: ready");
+    }, delay);
+  }
+
+  // Restore the default empire status text after a short delay.
+  scheduleEmpireStatusReset(delay = 3000) {
+    if (this.empireStatusResetTimer) {
+      clearTimeout(this.empireStatusResetTimer);
+    }
+
+    this.empireStatusResetTimer = setTimeout(() => {
+      this.empireStatusResetTimer = null;
+      this.setEmpireStatus("Empire: ready");
     }, delay);
   }
 
@@ -1518,6 +1554,24 @@ export const Actions = new (class {
 
   // Keep the commander/admin status line in sync while a manual action is running.
   updateManualAdminStatus() {
+    if (this.manualReinforcementRequested && this.manualCommanderUpgradeRequested) {
+      const remainingUnits =
+        this.reinforcementQueue.length + (this.reinforcementInFlight ? 1 : 0);
+      const remainingCommanders = this.manualCommanderPendingIds.length;
+      const completedCommanders = Math.min(
+        this.manualCommanderUpgradeCompleted,
+        this.manualCommanderUpgradeTotal,
+      );
+      const currentCommanderLabel = this.manualCommanderCurrentName
+        ? ` — ${this.manualCommanderCurrentName}`
+        : "";
+
+      this.setCommanderStatus(
+        `Military upkeep… ${this.manualReinforcementSucceeded} reinforced, ${this.manualReinforcementSkipped} skipped, ${remainingUnits} units left, ${completedCommanders}/${this.manualCommanderUpgradeTotal} commanders done, ${remainingCommanders} commanders left${currentCommanderLabel}`,
+      );
+      return;
+    }
+
     if (this.manualReinforcementRequested) {
       const remainingUnits =
         this.reinforcementQueue.length + (this.reinforcementInFlight ? 1 : 0);
@@ -3053,6 +3107,34 @@ export const Actions = new (class {
     this.processAdminQueues();
   }
 
+  // Fire a one-click empire tune-up that chains together the highest-value maintenance cheats.
+  runEmpireMaintenance() {
+    if (!this.getLocalPlayer()) {
+      this.setEmpireStatus("Empire: no local player found.");
+      console.log("Dev panel: no local player found for empire maintenance.");
+      this.scheduleEmpireStatusReset();
+      return;
+    }
+
+    this.setEmpireStatus(
+      "Empire: tune-up launched — economy, cities, armies, and research queued.",
+    );
+    console.log("Dev panel: launching full empire maintenance.");
+
+    this.addGold();
+    this.addInfluence();
+    this.addHappiness();
+    this.startGoldenAge();
+    this.completeProduction();
+    this.addPopulation();
+    this.healUnits();
+    this.addXp();
+    this.reinforceAllAvailableUnits();
+    this.upgradeAllAvailableUnits();
+    this.completeAllResearchAndCivics();
+    this.scheduleEmpireStatusReset(4500);
+  }
+
   // Queue every commander that can currently spend promotions, commendations, or formation upgrades.
   upgradeSelectedCommander() {
     const commanders = this.getCommanderUnits();
@@ -3401,6 +3483,8 @@ export const Actions = new (class {
     } else {
       this.setProgressionStatus("Progression: ready");
     }
+
+    this.setEmpireStatus("Empire: ready");
 
     if (this.manualUnitUpgradeRequested) {
       this.updateManualUnitUpgradeStatus();
