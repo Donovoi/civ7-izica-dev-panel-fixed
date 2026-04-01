@@ -19,8 +19,14 @@ export const Actions = new (class {
   // Track whether a global reinforce-all sweep is currently running.
   reinforcementSweepRequested = false;
 
+  // Hold the queued unit upgrades for the current manual upgrade-all sweep.
+  unitUpgradeQueue = [];
+
   // Track the unit currently being assigned to a commander.
   reinforcementInFlight = null;
+
+  // Track the unit currently being upgraded by the manual upgrade-all sweep.
+  unitUpgradeInFlight = null;
 
   // Hold the queued reinforcement actions for the current sweep.
   reinforcementQueue = [];
@@ -56,8 +62,23 @@ export const Actions = new (class {
   // Track whether the user manually kicked off a reinforce-all sweep.
   manualReinforcementRequested = false;
 
+  // Track whether the user manually kicked off an upgrade-all-units sweep.
+  manualUnitUpgradeRequested = false;
+
+  // Track total / processed / skipped units for the visible manual unit-upgrade sweep.
+  manualUnitUpgradeTotal = 0;
+  manualUnitUpgradeProcessed = 0;
+  manualUnitUpgradeSucceeded = 0;
+  manualUnitUpgradeSkipped = 0;
+
+  // Track the unit currently being worked on for the visible manual unit-upgrade sweep.
+  manualUnitUpgradeCurrentName = "";
+
   // Store the timer used to restore the idle status text after a completion message.
   commanderStatusResetTimer = null;
+
+  // Store the timer used to restore the idle unit status text after a completion message.
+  unitsStatusResetTimer = null;
 
   // Store the timer used to restore the idle progression status text after a completion message.
   progressionStatusResetTimer = null;
@@ -165,6 +186,7 @@ export const Actions = new (class {
     "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or formation upgrades, including land, naval, and air commanders.",
     "reinforce-all-units": "Send every eligible land, sea, and air unit to a valid commander.",
     "toggle-infinite-movement": "Toggle infinite movement for your units.",
+    "upgrade-all-units": "Upgrade every local non-commander unit that can currently use the stock Upgrade Unit command, respecting the game's normal gold, territory, and resource requirements.",
     "heal-units": "Heal every alive player's unit, including packed and traveling units when possible.",
     "add-xp": "Grant max safe XP to every local unit. Regular units still get a huge XP boost, but commanders stop at their remaining promotion-point cap to avoid overflowing native counters.",
     "clear-all-logs": "Clear the mirrored dev console buffer and every stored profiler session log so the next repro starts from a clean slate.",
@@ -195,6 +217,12 @@ export const Actions = new (class {
   // Track a unique token for each in-flight commander admin step so stale timers can be ignored safely.
   commanderAdminActionSequence = 0;
 
+  // Track a unique token for each in-flight unit-upgrade step so stale timers can be ignored safely.
+  unitUpgradeActionSequence = 0;
+
+  // Prevent multiple delayed unit-upgrade refreshes from piling up at once.
+  unitUpgradeRefreshScheduled = false;
+
   // Make sure engine listeners are registered only once.
   commanderAdminListenersRegistered = false;
 
@@ -220,6 +248,7 @@ export const Actions = new (class {
     this.completeAllResearchAndCivics = this.completeAllResearchAndCivics.bind(this);
     this.toggleAutoplayMastery = this.toggleAutoplayMastery.bind(this);
     this.cycleAutoplayMasteryBias = this.cycleAutoplayMasteryBias.bind(this);
+    this.upgradeAllAvailableUnits = this.upgradeAllAvailableUnits.bind(this);
     this.healUnits = this.healUnits.bind(this);
     this.addXp = this.addXp.bind(this);
     this.sleepAllUnits = this.sleepAllUnits.bind(this);
@@ -311,6 +340,9 @@ export const Actions = new (class {
 
       // Assign every currently reinforceable unit to a valid commander plot.
       "reinforce-all-units": this.reinforceAllAvailableUnits,
+
+      // Upgrade every currently upgradeable non-commander unit.
+      "upgrade-all-units": this.upgradeAllAvailableUnits,
 
       // Give the player gold.
       "add-gold": this.addGold,
@@ -443,6 +475,28 @@ export const Actions = new (class {
     this.manualReinforcementSkipped = 0;
   }
 
+  // Reset the visible progress state for the manual unit-upgrade action.
+  resetManualUnitUpgradeProgress() {
+    this.manualUnitUpgradeTotal = 0;
+    this.manualUnitUpgradeProcessed = 0;
+    this.manualUnitUpgradeSucceeded = 0;
+    this.manualUnitUpgradeSkipped = 0;
+    this.manualUnitUpgradeCurrentName = "";
+    this.unitUpgradeQueue = [];
+    this.unitUpgradeInFlight = null;
+  }
+
+  // Start a fresh visible progress batch for the manual unit-upgrade action.
+  beginManualUnitUpgradeProgress(unitIds) {
+    this.manualUnitUpgradeTotal = unitIds.length;
+    this.manualUnitUpgradeProcessed = 0;
+    this.manualUnitUpgradeSucceeded = 0;
+    this.manualUnitUpgradeSkipped = 0;
+    this.manualUnitUpgradeCurrentName = "";
+    this.unitUpgradeQueue = [...unitIds];
+    this.unitUpgradeInFlight = null;
+  }
+
   // Read the currently selected unit ID if one exists.
   getSelectedUnitId() {
     const selectedUnitId = UI.Player.getHeadSelectedUnit?.();
@@ -562,6 +616,22 @@ export const Actions = new (class {
     element.textContent = message;
   }
 
+  // Find the dev-panel status line for unit-wide helpers.
+  getUnitsStatusElement() {
+    return document.querySelector(".dev-panel-status--units");
+  }
+
+  // Update the units status line shown in the panel.
+  setUnitsStatus(message) {
+    const element = this.getUnitsStatusElement();
+
+    if (!element) {
+      return;
+    }
+
+    element.textContent = message;
+  }
+
   // Restore the default commander/admin status text after a short delay.
   scheduleCommanderStatusReset(delay = 2500) {
     if (this.commanderStatusResetTimer) {
@@ -571,6 +641,18 @@ export const Actions = new (class {
     this.commanderStatusResetTimer = setTimeout(() => {
       this.commanderStatusResetTimer = null;
       this.setCommanderStatus("Commanders: ready");
+    }, delay);
+  }
+
+  // Restore the default units status text after a short delay.
+  scheduleUnitsStatusReset(delay = 2500) {
+    if (this.unitsStatusResetTimer) {
+      clearTimeout(this.unitsStatusResetTimer);
+    }
+
+    this.unitsStatusResetTimer = setTimeout(() => {
+      this.unitsStatusResetTimer = null;
+      this.setUnitsStatus("Units: ready");
     }, delay);
   }
 
@@ -700,7 +782,7 @@ export const Actions = new (class {
   }
 
   // Try one stock unit command again after the selection/UI focus has had a frame to catch up.
-  sendUnitCommandAfterSelectionSettles(unitId, commandType, args) {
+  sendUnitCommandAfterSelectionSettles(unitId, commandType, args, onFailure = null) {
     if (!ComponentID.isValid(unitId)) {
       return false;
     }
@@ -719,7 +801,12 @@ export const Actions = new (class {
     const unitLabel = this.getUnitDisplayName(unitId);
     const maxAttempts = 3;
     let attemptCount = 0;
-    const releaseCommanderRetry = () => {
+    const releaseQueuedFailure = () => {
+      if (typeof onFailure === "function") {
+        onFailure();
+        return;
+      }
+
       if (!this.isSameComponentId(this.commanderAdminInFlight?.unitId, unitId)) {
         return;
       }
@@ -746,7 +833,7 @@ export const Actions = new (class {
           previousSelectionId,
           alreadySelected,
         );
-        releaseCommanderRetry();
+        releaseQueuedFailure();
         return;
       }
 
@@ -782,7 +869,7 @@ export const Actions = new (class {
         previousSelectionId,
         alreadySelected,
       );
-      releaseCommanderRetry();
+      releaseQueuedFailure();
     };
 
     requestAnimationFrame(attemptSend);
@@ -810,7 +897,7 @@ export const Actions = new (class {
   }
 
   // Send one stock unit command while minimizing how long automation owns the UI selection.
-  sendUnitCommand(unitId, commandType, args) {
+  sendUnitCommand(unitId, commandType, args, onFailure = null) {
     const directResult = this.canStartUnitCommand(unitId, commandType, args);
 
     if (directResult?.Success) {
@@ -818,7 +905,12 @@ export const Actions = new (class {
       return true;
     }
 
-    return this.sendUnitCommandAfterSelectionSettles(unitId, commandType, args);
+    return this.sendUnitCommandAfterSelectionSettles(
+      unitId,
+      commandType,
+      args,
+      onFailure,
+    );
   }
 
   // Register the autoplay/admin listeners exactly once.
@@ -1455,6 +1547,28 @@ export const Actions = new (class {
     this.setCommanderStatus("Commanders: ready");
   }
 
+  // Keep the units status line in sync while a manual upgrade-all-units sweep is running.
+  updateManualUnitUpgradeStatus() {
+    if (!this.manualUnitUpgradeRequested) {
+      this.setUnitsStatus("Units: ready");
+      return;
+    }
+
+    const remainingUnits = Math.max(
+      this.unitUpgradeQueue.length,
+      this.unitUpgradeInFlight ? 1 : 0,
+    );
+    const currentUnitLabel = this.manualUnitUpgradeCurrentName
+      ? ` — ${this.manualUnitUpgradeCurrentName}`
+      : "";
+
+    this.setUnitsStatus(
+      remainingUnits > 0
+        ? `Upgrading units… ${this.manualUnitUpgradeSucceeded}/${this.manualUnitUpgradeTotal} upgraded, ${this.manualUnitUpgradeSkipped} skipped, ${remainingUnits} left${currentUnitLabel}`
+        : "Upgrading units… finalizing",
+    );
+  }
+
   // Finalize the visible status when a manual commander/admin sweep becomes idle.
   finishManualAdminStatusIfIdle() {
     if (this.manualReinforcementRequested && this.manualCommanderUpgradeRequested) {
@@ -1531,6 +1645,254 @@ export const Actions = new (class {
     }
 
     this.setCommanderStatus("Commanders: ready");
+  }
+
+  // Finalize the visible status when a manual upgrade-all-units sweep becomes idle.
+  finishManualUnitUpgradeStatusIfIdle() {
+    if (this.unitUpgradeInFlight || this.unitUpgradeQueue.length > 0) {
+      this.updateManualUnitUpgradeStatus();
+      return;
+    }
+
+    if (!this.manualUnitUpgradeRequested) {
+      this.setUnitsStatus("Units: ready");
+      return;
+    }
+
+    const upgradedUnits = this.manualUnitUpgradeSucceeded;
+    const skippedUnits = this.manualUnitUpgradeSkipped;
+
+    this.manualUnitUpgradeRequested = false;
+    this.resetManualUnitUpgradeProgress();
+    this.setUnitsStatus(
+      `Unit upgrades finished (${upgradedUnits} upgraded, ${skippedUnits} skipped).`,
+    );
+    console.log(
+      `Dev panel: unit upgrade sweep finished (${upgradedUnits} upgraded, ${skippedUnits} skipped).`,
+    );
+    this.refreshSelectedUnitUI();
+    this.scheduleUnitsStatusReset();
+  }
+
+  // Return every local non-commander unit that can currently use the stock Upgrade Unit command.
+  getUpgradeableUnits(unitIds = null) {
+    const localPlayerId = this.getLocalPlayerId();
+    const candidateUnits = (unitIds ?? this.getLocalUnits().map((unit) => unit.id))
+      .map((unitId) => (ComponentID.isValid(unitId) ? Units.get(unitId) : unitId))
+      .filter(
+        (unit) =>
+          unit !== null &&
+          unit !== undefined &&
+          !unit.isCommanderUnit &&
+          unit.owner === localPlayerId,
+      );
+
+    return candidateUnits.filter((unit) =>
+      Boolean(
+        this.canStartUnitCommand(
+          unit.id,
+          "UNITCOMMAND_UPGRADE",
+          this.getDefaultCommandArgs(),
+          true,
+        )?.Success,
+      ),
+    );
+  }
+
+  // Mark one queued unit upgrade step as completed and advance visible progress.
+  completeUnitUpgradeStep(unitId, didSucceed) {
+    const queueIndex = this.unitUpgradeQueue.findIndex((queuedUnitId) =>
+      this.isSameComponentId(queuedUnitId, unitId),
+    );
+
+    if (queueIndex >= 0) {
+      this.unitUpgradeQueue.splice(queueIndex, 1);
+    }
+
+    if (this.isSameComponentId(this.unitUpgradeInFlight?.unitId, unitId)) {
+      this.unitUpgradeInFlight = null;
+    }
+
+    if (!this.manualUnitUpgradeRequested) {
+      return;
+    }
+
+    this.manualUnitUpgradeProcessed = Math.min(
+      this.manualUnitUpgradeProcessed + 1,
+      this.manualUnitUpgradeTotal,
+    );
+
+    if (didSucceed) {
+      this.manualUnitUpgradeSucceeded = Math.min(
+        this.manualUnitUpgradeSucceeded + 1,
+        this.manualUnitUpgradeProcessed,
+      );
+    } else {
+      this.manualUnitUpgradeSkipped = Math.min(
+        this.manualUnitUpgradeSkipped + 1,
+        this.manualUnitUpgradeProcessed,
+      );
+    }
+
+    if (this.unitUpgradeQueue.length <= 0) {
+      this.manualUnitUpgradeCurrentName = "";
+    }
+  }
+
+  // Schedule a delayed unit-upgrade queue drain so repeated UI refreshes do not stack.
+  scheduleUnitUpgradeProcessing(delay = 0) {
+    if (this.unitUpgradeRefreshScheduled) {
+      return;
+    }
+
+    this.unitUpgradeRefreshScheduled = true;
+
+    const runUpgradeStep = () => {
+      this.unitUpgradeRefreshScheduled = false;
+      this.processUnitUpgradeQueue();
+    };
+
+    if (delay > 0) {
+      setTimeout(runUpgradeStep, delay);
+      return;
+    }
+
+    requestAnimationFrame(runUpgradeStep);
+  }
+
+  // Poll one in-flight unit-upgrade step until the command has clearly landed or become unavailable.
+  monitorUnitUpgradeInFlight(token, delay = 300) {
+    setTimeout(() => {
+      const inFlight = this.unitUpgradeInFlight;
+
+      if (!inFlight || inFlight.token !== token) {
+        return;
+      }
+
+      const unit = Units.get(inFlight.unitId);
+
+      if (!unit) {
+        this.completeUnitUpgradeStep(inFlight.unitId, true);
+        this.scheduleUnitUpgradeProcessing();
+        return;
+      }
+
+      const upgradeStillAvailable = Boolean(
+        this.canStartUnitCommand(
+          unit.id,
+          "UNITCOMMAND_UPGRADE",
+          this.getDefaultCommandArgs(),
+          true,
+        )?.Success,
+      );
+
+      if (unit.type !== inFlight.beforeType || !upgradeStillAvailable) {
+        this.completeUnitUpgradeStep(unit.id, true);
+        this.scheduleUnitUpgradeProcessing();
+        return;
+      }
+
+      const elapsed = Date.now() - inFlight.startedAt;
+
+      if (elapsed < 5000) {
+        this.monitorUnitUpgradeInFlight(token, elapsed < 2000 ? 250 : 450);
+        return;
+      }
+
+      console.warn(
+        `Dev panel: unit ${this.getUnitDisplayName(unit)} did not finish upgrading after ${elapsed} ms; skipping it.`,
+      );
+      this.completeUnitUpgradeStep(unit.id, false);
+      this.scheduleUnitUpgradeProcessing();
+    }, delay);
+  }
+
+  // Drain the manual unit-upgrade queue one safe stock upgrade request at a time.
+  processUnitUpgradeQueue() {
+    if (this.unitUpgradeInFlight) {
+      this.updateManualUnitUpgradeStatus();
+      return;
+    }
+
+    if (
+      this.reinforcementInFlight ||
+      this.commanderAdminInFlight ||
+      this.reinforcementSweepRequested ||
+      this.commanderAdminQueue.length > 0
+    ) {
+      if (this.manualUnitUpgradeRequested) {
+        this.updateManualUnitUpgradeStatus();
+        this.scheduleUnitUpgradeProcessing(200);
+      }
+
+      return;
+    }
+
+    const localPlayerId = this.getLocalPlayerId();
+
+    while (this.unitUpgradeQueue.length > 0) {
+      const unitId = this.unitUpgradeQueue[0];
+      const unit = Units.get(unitId);
+
+      if (!unit || unit.isCommanderUnit || localPlayerId === null || unit.owner !== localPlayerId) {
+        this.completeUnitUpgradeStep(unitId, false);
+        continue;
+      }
+
+      const upgradeResult = this.canStartUnitCommand(
+        unit.id,
+        "UNITCOMMAND_UPGRADE",
+        this.getDefaultCommandArgs(),
+        true,
+      );
+
+      if (!upgradeResult?.Success) {
+        this.completeUnitUpgradeStep(unit.id, false);
+        continue;
+      }
+
+      this.manualUnitUpgradeCurrentName = this.getUnitDisplayName(unit);
+
+      const token = ++this.unitUpgradeActionSequence;
+
+      this.unitUpgradeInFlight = {
+        unitId: unit.id,
+        token,
+        startedAt: Date.now(),
+        beforeType: unit.type,
+      };
+
+      const didStart = this.sendUnitCommand(
+        unit.id,
+        "UNITCOMMAND_UPGRADE",
+        this.getDefaultCommandArgs(),
+        () => {
+          if (!this.isSameComponentId(this.unitUpgradeInFlight?.unitId, unit.id)) {
+            return;
+          }
+
+          console.warn(
+            `Dev panel: could not start UNITCOMMAND_UPGRADE for ${this.getUnitDisplayName(unit)}.`,
+          );
+          this.completeUnitUpgradeStep(unit.id, false);
+          this.scheduleUnitUpgradeProcessing();
+        },
+      );
+
+      if (didStart) {
+        console.log(
+          `Dev panel: upgrading unit ${this.manualUnitUpgradeCurrentName}.`,
+        );
+        this.monitorUnitUpgradeInFlight(token);
+        this.updateManualUnitUpgradeStatus();
+        return;
+      }
+
+      this.unitUpgradeInFlight = null;
+      this.completeUnitUpgradeStep(unit.id, false);
+    }
+
+    this.finishManualUnitUpgradeStatusIfIdle();
   }
 
   // Score one reinforce target so the sweep can prefer the closest valid commander plot.
@@ -2713,6 +3075,32 @@ export const Actions = new (class {
     this.processAdminQueues();
   }
 
+  // Queue every local non-commander unit that can currently use the stock Upgrade Unit command.
+  upgradeAllAvailableUnits() {
+    const upgradeableUnits = this.getUpgradeableUnits();
+
+    if (upgradeableUnits.length <= 0) {
+      this.manualUnitUpgradeRequested = false;
+      this.resetManualUnitUpgradeProgress();
+      this.setUnitsStatus("No local units can upgrade right now.");
+      console.log("Dev panel: no local units can upgrade right now.");
+      this.scheduleUnitsStatusReset();
+      return;
+    }
+
+    this.manualUnitUpgradeRequested = true;
+    this.beginManualUnitUpgradeProgress(
+      upgradeableUnits.map((unit) => unit.id),
+    );
+    this.setUnitsStatus(
+      `Upgrading units… 0/${upgradeableUnits.length} upgraded, 0 skipped, ${upgradeableUnits.length} left`,
+    );
+    console.log(
+      `Dev panel: scanning ${upgradeableUnits.length} unit(s) for upgrades.`,
+    );
+    this.scheduleUnitUpgradeProcessing();
+  }
+
   // Start a fresh autoplay admin sweep when autoplay begins.
   onAutoplayStarted() {
     this.autoplayMasteryTurnCounter = 0;
@@ -2881,7 +3269,24 @@ export const Actions = new (class {
     const localPlayerId = this.getLocalPlayerId();
     const unit = Units.get(data.unit) ?? data.unit;
 
-    if (localPlayerId === null || !unit?.isCommanderUnit || unit.owner !== localPlayerId) {
+    if (localPlayerId === null || !unit || unit.owner !== localPlayerId) {
+      return;
+    }
+
+    if (data.command === Database.makeHash("UNITCOMMAND_UPGRADE")) {
+      if (
+        !this.manualUnitUpgradeRequested &&
+        !this.isSameComponentId(this.unitUpgradeInFlight?.unitId, unit.id)
+      ) {
+        return;
+      }
+
+      this.completeUnitUpgradeStep(unit.id, true);
+      this.scheduleUnitUpgradeProcessing();
+      return;
+    }
+
+    if (!unit.isCommanderUnit) {
       return;
     }
 
@@ -2958,9 +3363,16 @@ export const Actions = new (class {
       this.setProgressionStatus("Progression: ready");
     }
 
+    if (this.manualUnitUpgradeRequested) {
+      this.updateManualUnitUpgradeStatus();
+    } else {
+      this.setUnitsStatus("Units: ready");
+    }
+
     this.syncAutoplayStatus();
 
     this.finishManualAdminStatusIfIdle();
+    this.finishManualUnitUpgradeStatusIfIdle();
   }
 
   updateFontSize(value = 0) {
