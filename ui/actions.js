@@ -2350,6 +2350,20 @@ export const Actions = new (class {
     );
   }
 
+  // Collect every commendation node a commander can still unlock through later XP levels.
+  getCommanderCommendationMetadata(commander) {
+    const unitDefinition = GameInfo.Units.lookup(commander?.type);
+    const promotionClassType = unitDefinition?.PromotionClass;
+
+    if (!promotionClassType) {
+      return [];
+    }
+
+    return this.getPromotionMetadataForClass(promotionClassType).filter(
+      (candidate) => Boolean(candidate.promotion?.Commendation),
+    );
+  }
+
   // Count how many regular promotion nodes this commander still has not purchased.
   getCommanderRemainingPromotionCount(commander) {
     const experience = commander?.Experience;
@@ -2359,6 +2373,23 @@ export const Actions = new (class {
     }
 
     return this.getCommanderPrimaryPromotionMetadata(commander).filter(
+      (candidate) =>
+        !experience.hasPromotion(
+          candidate.disciplineType,
+          candidate.promotionType,
+        ),
+    ).length;
+  }
+
+  // Count how many commendation nodes this commander still has not purchased.
+  getCommanderRemainingCommendationCount(commander) {
+    const experience = commander?.Experience;
+
+    if (!experience) {
+      return 0;
+    }
+
+    return this.getCommanderCommendationMetadata(commander).filter(
       (candidate) =>
         !experience.hasPromotion(
           candidate.disciplineType,
@@ -2389,7 +2420,18 @@ export const Actions = new (class {
       remainingPromotionCount: this.getCommanderRemainingPromotionCount(
         commander,
       ),
+      remainingCommendationCount: this.getCommanderRemainingCommendationCount(
+        commander,
+      ),
     };
+  }
+
+  // Check whether one commander has already banked enough points to buy every remaining regular promotion and commendation.
+  hasCommanderXpGrantReachedCap(state) {
+    return (
+      state.storedPromotionPoints >= state.remainingPromotionCount &&
+      state.storedCommendations >= state.remainingCommendationCount
+    );
   }
 
   // Check whether one commander XP snapshot visibly advanced level-up progress.
@@ -2410,7 +2452,7 @@ export const Actions = new (class {
     );
   }
 
-  // Top a commander up only to the highest remaining regular-promotion point total so native counters never overflow.
+  // Top a commander up only to the highest remaining promotion + commendation point totals so native counters never overflow.
   grantCommanderSafeXp(unitOrId) {
     const commander = ComponentID.isValid(unitOrId)
       ? Units.get(unitOrId)
@@ -2425,8 +2467,9 @@ export const Actions = new (class {
 
     const initialState = this.captureCommanderXpGrantState(commander);
     const targetPromotionPoints = initialState.remainingPromotionCount;
+    const targetCommendations = initialState.remainingCommendationCount;
 
-    if (targetPromotionPoints <= 0) {
+    if (targetPromotionPoints <= 0 && targetCommendations <= 0) {
       return {
         didChange: false,
         reason: "no-promotions-left",
@@ -2435,7 +2478,7 @@ export const Actions = new (class {
       };
     }
 
-    if (initialState.storedPromotionPoints >= targetPromotionPoints) {
+    if (this.hasCommanderXpGrantReachedCap(initialState)) {
       return {
         didChange: false,
         reason: "already-capped",
@@ -2444,19 +2487,24 @@ export const Actions = new (class {
       };
     }
 
-    const maxIterations = Math.max(
+    const missingPromotionPoints = Math.max(
       targetPromotionPoints - initialState.storedPromotionPoints,
       0,
-    ) + 2;
+    );
+    const missingCommendations = Math.max(
+      targetCommendations - initialState.storedCommendations,
+      0,
+    );
+    const maxIterations = Math.max(
+      missingPromotionPoints + missingCommendations,
+      0,
+    ) + 8;
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       const liveCommander = Units.get(commander.id) ?? commander;
       const beforeState = this.captureCommanderXpGrantState(liveCommander);
 
-      if (
-        beforeState.remainingPromotionCount <= 0 ||
-        beforeState.storedPromotionPoints >= beforeState.remainingPromotionCount
-      ) {
+      if (this.hasCommanderXpGrantReachedCap(beforeState)) {
         break;
       }
 
@@ -2509,19 +2557,17 @@ export const Actions = new (class {
     return {
       didChange:
         finalState.storedPromotionPoints !== initialState.storedPromotionPoints ||
+        finalState.storedCommendations !== initialState.storedCommendations ||
         finalState.level !== initialState.level ||
         finalState.experiencePoints !== initialState.experiencePoints,
-      reason:
-        finalState.storedPromotionPoints >= finalState.remainingPromotionCount
-          ? "capped"
-          : "partial",
+      reason: this.hasCommanderXpGrantReachedCap(finalState) ? "capped" : "partial",
       initialState,
       finalState,
     };
   }
 
   // Collect every currently available promotion or commendation for a commander.
-  getCommanderPromotionCandidates(commander) {
+  getCommanderPromotionCandidates(commander, allowTemporarySelection = false) {
     const experience = commander?.Experience;
 
     if (!experience) {
@@ -2531,10 +2577,6 @@ export const Actions = new (class {
     const unitDefinition = GameInfo.Units.lookup(commander.type);
 
     if (!unitDefinition?.PromotionClass) {
-      return [];
-    }
-
-    if (!this.readNativeBoolean(experience, "canPromote")) {
       return [];
     }
 
@@ -2549,13 +2591,37 @@ export const Actions = new (class {
           return false;
         }
 
-        return Boolean(
-          experience.canEarnPromotion(
-            candidate.disciplineType,
-            candidate.promotionType,
-            false,
-          ),
-        );
+        const promotionArgs = {
+          PromotionType: Database.makeHash(candidate.promotionType),
+          PromotionDisciplineType: Database.makeHash(candidate.disciplineType),
+        };
+
+        if (
+          this.canStartUnitCommand(
+            commander.id,
+            "UNITCOMMAND_PROMOTE",
+            promotionArgs,
+            allowTemporarySelection,
+          )?.Success
+        ) {
+          return true;
+        }
+
+        if (typeof experience.canEarnPromotion !== "function") {
+          return false;
+        }
+
+        try {
+          return Boolean(
+            experience.canEarnPromotion(
+              candidate.disciplineType,
+              candidate.promotionType,
+              false,
+            ),
+          );
+        } catch (_error) {
+          return false;
+        }
       },
     );
   }
@@ -5024,7 +5090,7 @@ export const Actions = new (class {
     }
 
     console.log(
-      `Dev panel: max safe XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersCapped} commander(s) filled to their promotion cap, ${commandersPartiallyCapped} commander(s) advanced partway, ${commandersAlreadyCapped} commander(s) already at cap.`,
+      `Dev panel: max safe XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersCapped} commander(s) filled to their promotion/commendation cap, ${commandersPartiallyCapped} commander(s) advanced partway, ${commandersAlreadyCapped} commander(s) already at cap.`,
     );
   }
 
