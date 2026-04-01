@@ -186,7 +186,7 @@ export const Actions = new (class {
     "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or formation upgrades, including land, naval, and air commanders.",
     "reinforce-all-units": "Send every eligible land, sea, and air unit to a valid commander.",
     "toggle-infinite-movement": "Toggle infinite movement for your units.",
-    "upgrade-all-units": "Upgrade every local non-commander unit that can currently use the stock Upgrade Unit command, respecting the game's normal gold, territory, and resource requirements.",
+    "upgrade-all-units": "Upgrade every currently eligible local unit and commander in one sweep. Regular units use the stock Upgrade Unit command, while commanders spend promotions, commendations, and army upgrades through the existing commander-admin queue.",
     "heal-units": "Heal every alive player's unit, including packed and traveling units when possible.",
     "add-xp": "Grant max safe XP to every local unit. Regular units still get a huge XP boost, but commanders stop at their remaining promotion-point cap to avoid overflowing native counters.",
     "clear-all-logs": "Clear the mirrored dev console buffer and every stored profiler session log so the next repro starts from a clean slate.",
@@ -1338,9 +1338,14 @@ export const Actions = new (class {
 
   // Count how many commanders still have a promotion, commendation, or formation upgrade available.
   getCommandersWithAdminActionsCount() {
+    return this.getCommandersWithAdminActions().length;
+  }
+
+  // Return every local commander that currently has a promotion, commendation, or formation upgrade available.
+  getCommandersWithAdminActions() {
     return this.getCommanderUnits().filter((commander) =>
       Boolean(this.getNextCommanderAdminAction(commander, true)),
-    ).length;
+    );
   }
 
   // Count how many commander entries are currently pending in the fast in-memory queue.
@@ -3078,27 +3083,61 @@ export const Actions = new (class {
   // Queue every local non-commander unit that can currently use the stock Upgrade Unit command.
   upgradeAllAvailableUnits() {
     const upgradeableUnits = this.getUpgradeableUnits();
+    const upgradeableCommanders = this.getCommandersWithAdminActions();
 
-    if (upgradeableUnits.length <= 0) {
+    if (upgradeableUnits.length <= 0 && upgradeableCommanders.length <= 0) {
       this.manualUnitUpgradeRequested = false;
       this.resetManualUnitUpgradeProgress();
-      this.setUnitsStatus("No local units can upgrade right now.");
-      console.log("Dev panel: no local units can upgrade right now.");
+      this.manualCommanderUpgradeRequested = false;
+      this.resetManualCommanderProgress();
+      this.setUnitsStatus("No local units or commanders can upgrade right now.");
+      this.setCommanderStatus("Commanders: ready");
+      console.log("Dev panel: no local units or commanders can upgrade right now.");
       this.scheduleUnitsStatusReset();
       return;
     }
 
-    this.manualUnitUpgradeRequested = true;
-    this.beginManualUnitUpgradeProgress(
-      upgradeableUnits.map((unit) => unit.id),
-    );
-    this.setUnitsStatus(
-      `Upgrading units… 0/${upgradeableUnits.length} upgraded, 0 skipped, ${upgradeableUnits.length} left`,
-    );
-    console.log(
-      `Dev panel: scanning ${upgradeableUnits.length} unit(s) for upgrades.`,
-    );
-    this.scheduleUnitUpgradeProcessing();
+    if (upgradeableCommanders.length > 0) {
+      this.manualCommanderUpgradeRequested = true;
+      this.beginManualCommanderProgress(
+        upgradeableCommanders.map((commander) => commander.id),
+      );
+      this.setCommanderStatus(
+        `Upgrading commanders… 0/${upgradeableCommanders.length} done, ${upgradeableCommanders.length} left, 0 actions sent`,
+      );
+      console.log(
+        `Dev panel: scanning ${upgradeableCommanders.length} commander(s) for upgrades.`,
+      );
+      upgradeableCommanders.forEach((commander) => {
+        this.enqueueCommanderForAdmin(commander.id);
+      });
+      this.processAdminQueues();
+    } else {
+      this.manualCommanderUpgradeRequested = false;
+      this.resetManualCommanderProgress();
+      this.setCommanderStatus("No commanders need upgrades right now.");
+      this.scheduleCommanderStatusReset();
+    }
+
+    if (upgradeableUnits.length > 0) {
+      this.manualUnitUpgradeRequested = true;
+      this.beginManualUnitUpgradeProgress(
+        upgradeableUnits.map((unit) => unit.id),
+      );
+      this.setUnitsStatus(
+        `Upgrading units… 0/${upgradeableUnits.length} upgraded, 0 skipped, ${upgradeableUnits.length} left`,
+      );
+      console.log(
+        `Dev panel: scanning ${upgradeableUnits.length} unit(s) for upgrades.`,
+      );
+      this.scheduleUnitUpgradeProcessing();
+      return;
+    }
+
+    this.manualUnitUpgradeRequested = false;
+    this.resetManualUnitUpgradeProgress();
+    this.setUnitsStatus("No regular units need upgrades right now; upgrading commanders.");
+    this.scheduleUnitsStatusReset(4000);
   }
 
   // Start a fresh autoplay admin sweep when autoplay begins.
