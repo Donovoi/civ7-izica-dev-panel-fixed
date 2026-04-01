@@ -78,6 +78,15 @@ export const Actions = new (class {
     civic: null,
   };
 
+  // Track whether autoplay should run with the cheat-assisted mastery helper enabled.
+  autoplayMasteryEnabled = true;
+
+  // Remember whether the current autoplay run still needs its one-time setup pass.
+  autoplayMasteryNeedsSetup = false;
+
+  // Collapse duplicate mastery bursts when the same autoplay start fires multiple nearby events.
+  autoplayMasteryLastRunAt = 0;
+
   // Track whether the fast-gameplay option bundle is currently enabled through the dev panel.
   fastGameplayEnabled = false;
 
@@ -137,10 +146,11 @@ export const Actions = new (class {
     "complete-tech": "Finish the active technology.",
     "complete-civic": "Finish the active civic.",
     "complete-all-research-civics": "Finish every remaining technology and civic, auto-pick the next node each time, and stop once Future Tech and Future Civic are selected.",
-    "autoplay-1": "Start autoplay for 1 turn and run admin automation.",
-    "autoplay-5": "Start autoplay for 5 turns and run admin automation.",
-    "autoplay-10": "Start autoplay for 10 turns and run admin automation.",
-    "autoplay-25": "Start autoplay for 25 turns and run admin automation.",
+    "toggle-autoplay-mastery": "Toggle a cheat-assisted autoplay helper that reveals the map, forces first contact, boosts the local economy and production, heals and buffs units, maxes out research, and keeps commander admin automation running. This makes autoplay far stronger, but it is not a true engine-level forward-search AI.",
+    "autoplay-1": "Start autoplay for 1 turn. When Master mode is enabled, autoplay also gets aggressive research, economy, production, healing, and commander-support boosts.",
+    "autoplay-5": "Start autoplay for 5 turns. When Master mode is enabled, autoplay also gets aggressive research, economy, production, healing, and commander-support boosts.",
+    "autoplay-10": "Start autoplay for 10 turns. When Master mode is enabled, autoplay also gets aggressive research, economy, production, healing, and commander-support boosts.",
+    "autoplay-25": "Start autoplay for 25 turns. When Master mode is enabled, autoplay also gets aggressive research, economy, production, healing, and commander-support boosts.",
     "start-golden-age": "Start a golden age / celebration.",
     "reveal-map": "Reveal every plot for your player.",
     "meet-all": "Trigger first contact with every living player.",
@@ -181,6 +191,7 @@ export const Actions = new (class {
     this.completeTech = this.completeTech.bind(this);
     this.completeCivic = this.completeCivic.bind(this);
     this.completeAllResearchAndCivics = this.completeAllResearchAndCivics.bind(this);
+    this.toggleAutoplayMastery = this.toggleAutoplayMastery.bind(this);
     this.healUnits = this.healUnits.bind(this);
     this.addXp = this.addXp.bind(this);
     this.sleepAllUnits = this.sleepAllUnits.bind(this);
@@ -248,6 +259,9 @@ export const Actions = new (class {
 
       // Clear the mirrored dev console buffer and every stored profiler session log.
       "clear-all-logs": this.clearAllLogs,
+
+      // Toggle the cheat-assisted autoplay mastery helper.
+      "toggle-autoplay-mastery": this.toggleAutoplayMastery,
 
       // Queue autoplay for 1 turn.
       "autoplay-1": this.startAutoplay(1),
@@ -493,6 +507,22 @@ export const Actions = new (class {
   // Update the performance status line shown in the panel.
   setPerformanceStatus(message) {
     const element = this.getPerformanceStatusElement();
+
+    if (!element) {
+      return;
+    }
+
+    element.textContent = message;
+  }
+
+  // Find the dev-panel status line for autoplay helpers.
+  getAutoplayStatusElement() {
+    return document.querySelector(".dev-panel-status--autoplay");
+  }
+
+  // Update the autoplay status line shown in the panel.
+  setAutoplayStatus(message) {
+    const element = this.getAutoplayStatusElement();
 
     if (!element) {
       return;
@@ -2053,6 +2083,214 @@ export const Actions = new (class {
     this.processAdminQueues();
   }
 
+  // Read the persisted autoplay mastery preference, defaulting new installs to the stronger helper mode.
+  isAutoplayMasteryEnabled() {
+    const storedValue = Storage.get("dev-panel-autoplay-mastery");
+
+    return storedValue === null ? true : Boolean(storedValue);
+  }
+
+  // Update the autoplay mastery toggle button label.
+  updateAutoplayMasteryLabel() {
+    const label = document.querySelector(
+      ".dev-panel-button__label--toggle-autoplay-mastery",
+    );
+
+    if (label) {
+      label.textContent = this.autoplayMasteryEnabled
+        ? "Master mode: On"
+        : "Master mode: Off";
+    }
+  }
+
+  // Keep the autoplay status line aligned with the current mode when no richer message is active.
+  syncAutoplayStatus() {
+    if (Autoplay.isActive) {
+      this.setAutoplayStatus(
+        this.autoplayMasteryEnabled
+          ? "Autoplay: master mode running."
+          : "Autoplay: stock AI + admin running.",
+      );
+      return;
+    }
+
+    this.setAutoplayStatus(
+      this.autoplayMasteryEnabled
+        ? "Autoplay: master mode armed."
+        : "Autoplay: stock AI + admin only.",
+    );
+  }
+
+  // Toggle the cheat-assisted autoplay mastery helper on or off.
+  toggleAutoplayMastery() {
+    const nextEnabled = !this.autoplayMasteryEnabled;
+
+    this.autoplayMasteryEnabled = nextEnabled;
+    this.autoplayMasteryNeedsSetup = nextEnabled
+      ? this.autoplayMasteryNeedsSetup || Autoplay.isActive
+      : false;
+    Storage.set("dev-panel-autoplay-mastery", nextEnabled);
+    this.updateAutoplayMasteryLabel();
+    this.syncAutoplayStatus();
+
+    if (nextEnabled && Autoplay.isActive) {
+      this.runAutoplayMasteryTasks("toggle");
+    }
+
+    console.log(
+      `Dev panel: autoplay master mode ${nextEnabled ? "enabled" : "disabled"}.`,
+    );
+  }
+
+  // Check whether autoplay still needs to push the player onto Future Tech / Future Civic.
+  shouldPrimeAutoplayMasteryResearch(player = this.getLocalPlayer()) {
+    if (!player || this.progressionAutomationRequested) {
+      return false;
+    }
+
+    const techBranch = this.getProgressionBranchState("tech", player);
+    const civicBranch = this.getProgressionBranchState("civic", player);
+    const techAtRepeatable = Boolean(
+      techBranch?.activeNodeType &&
+        this.isRepeatableProgressionNode(techBranch.activeNodeType),
+    );
+    const civicAtRepeatable = Boolean(
+      civicBranch?.activeNodeType &&
+        this.isRepeatableProgressionNode(civicBranch.activeNodeType),
+    );
+
+    return !techAtRepeatable || !civicAtRepeatable;
+  }
+
+  // Heal only the local player's units so autoplay gets the benefit without patching up the entire world.
+  healLocalUnits() {
+    for (const unit of this.getLocalUnits()) {
+      Units.setDamage(unit.id, 0);
+    }
+  }
+
+  // Buff one local unit for autoplay mastery, using the safe commander XP path where needed.
+  boostUnitForAutoplayMastery(unitOrId) {
+    const localPlayerId = this.getLocalPlayerId();
+    const unit = ComponentID.isValid(unitOrId) ? Units.get(unitOrId) : unitOrId;
+
+    if (!unit || localPlayerId === null || unit.owner !== localPlayerId) {
+      return false;
+    }
+
+    Units.setDamage(unit.id, 0);
+
+    if (unit.isCommanderUnit) {
+      this.grantCommanderSafeXp(unit);
+      this.enqueueCommanderForAdmin(unit.id);
+      return true;
+    }
+
+    Units.changeExperience(unit.id, 10000000);
+    return true;
+  }
+
+  // Prime every current local unit once at the start of a mastery-backed autoplay run.
+  primeAutoplayMasteryUnits(units = this.getLocalUnits()) {
+    let regularUnitsBuffed = 0;
+    let commandersPrimed = 0;
+
+    units.forEach((unit) => {
+      if (!this.boostUnitForAutoplayMastery(unit)) {
+        return;
+      }
+
+      if (unit.isCommanderUnit) {
+        commandersPrimed += 1;
+        return;
+      }
+
+      regularUnitsBuffed += 1;
+    });
+
+    return {
+      regularUnitsBuffed,
+      commandersPrimed,
+    };
+  }
+
+  // Keep commanders topped up during autoplay without repeatedly blasting every regular unit with XP.
+  primeAutoplayMasteryCommanders(commanders = this.getCommanderUnits()) {
+    let commandersPrimed = 0;
+
+    commanders.forEach((commander) => {
+      if (!this.boostUnitForAutoplayMastery(commander)) {
+        return;
+      }
+
+      commandersPrimed += 1;
+    });
+
+    return commandersPrimed;
+  }
+
+  // Surround the stock autoplay AI with aggressive research, economy, production, and military support.
+  runAutoplayMasteryTasks(reason = "turn") {
+    if (!this.autoplayMasteryEnabled) {
+      this.runAutoplayAdminTasks();
+      this.syncAutoplayStatus();
+      return;
+    }
+
+    const player = this.getLocalPlayer();
+
+    if (!player) {
+      return;
+    }
+
+    const now = Date.now();
+    const needsSetup = this.autoplayMasteryNeedsSetup;
+
+    if (!needsSetup && now - this.autoplayMasteryLastRunAt < 800) {
+      return;
+    }
+
+    this.autoplayMasteryLastRunAt = now;
+    this.autoplayMasteryNeedsSetup = false;
+
+    if (needsSetup) {
+      this.revealMap();
+      this.meetAll();
+      this.addHappiness();
+      this.startGoldenAge();
+      this.addPopulation();
+    }
+
+    const cityCount = this.getLocalCities().length;
+    const buffSummary = needsSetup
+      ? this.primeAutoplayMasteryUnits()
+      : {
+        regularUnitsBuffed: 0,
+        commandersPrimed: this.primeAutoplayMasteryCommanders(),
+      };
+    const shouldPrimeResearch = this.shouldPrimeAutoplayMasteryResearch(player);
+
+    this.completeProduction();
+    this.addGold();
+    this.addInfluence();
+    this.healLocalUnits();
+
+    if (shouldPrimeResearch) {
+      this.completeAllResearchAndCivics();
+    }
+
+    this.runAutoplayAdminTasks();
+
+    this.setAutoplayStatus(
+      needsSetup
+        ? `Autoplay: master setup ran — map revealed, contacts forced, ${cityCount} cities primed, ${buffSummary.regularUnitsBuffed} regular units buffed, ${buffSummary.commandersPrimed} commanders primed${shouldPrimeResearch ? ", research sweep armed" : ""}.`
+        : `Autoplay: master upkeep ran — production, economy, healing, ${buffSummary.commandersPrimed} commanders primed${shouldPrimeResearch ? ", research sweep armed" : ""}.`,
+    );
+    console.log(
+      `Dev panel: autoplay master ${needsSetup ? "setup" : reason} complete (cities=${cityCount}, regularUnits=${buffSummary.regularUnitsBuffed}, commanders=${buffSummary.commandersPrimed}, research=${shouldPrimeResearch ? "primed" : "steady"}).`,
+    );
+  }
+
   // Queue every currently reinforceable unit and let the engine assign them to valid commanders.
   reinforceAllAvailableUnits() {
     const reinforceableUnits = this.replaceReinforcementQueue();
@@ -2105,7 +2343,11 @@ export const Actions = new (class {
 
   // Start a fresh autoplay admin sweep when autoplay begins.
   onAutoplayStarted() {
-    this.runAutoplayAdminTasks();
+    if (this.autoplayMasteryEnabled && Date.now() - this.autoplayMasteryLastRunAt > 1000) {
+      this.autoplayMasteryNeedsSetup = true;
+    }
+
+    this.runAutoplayMasteryTasks("started");
   }
 
   // Re-run autoplay admin tasks at the start of the local player's autoplay turn.
@@ -2116,7 +2358,7 @@ export const Actions = new (class {
       return;
     }
 
-    this.runAutoplayAdminTasks();
+    this.runAutoplayMasteryTasks("turn");
   }
 
   // Queue newly created commanders so autoplay can immediately clean up their admin work too.
@@ -2139,6 +2381,10 @@ export const Actions = new (class {
     if (Autoplay.isActive) {
       // New local units may be reinforceable immediately.
       this.enqueueReinforcementUnit(unit.id);
+
+      if (this.autoplayMasteryEnabled) {
+        this.boostUnitForAutoplayMastery(unit);
+      }
     }
 
     if (unit.isCommanderUnit) {
@@ -2320,6 +2566,8 @@ export const Actions = new (class {
 
     this.applyFastGameplaySettings(this.isFastGameplayEnabled());
     this.updatePerformanceProfilerLabel();
+    this.autoplayMasteryEnabled = this.isAutoplayMasteryEnabled();
+    this.updateAutoplayMasteryLabel();
 
     if (this.performanceProfilerEnabled) {
       this.setPerformanceStatus("Profiler: sampling frame times…");
@@ -2332,6 +2580,8 @@ export const Actions = new (class {
     } else {
       this.setProgressionStatus("Progression: ready");
     }
+
+    this.syncAutoplayStatus();
 
     this.finishManualAdminStatusIfIdle();
   }
@@ -2983,8 +3233,14 @@ export const Actions = new (class {
       // Observe the same player during autoplay.
       Autoplay.setObserveAsPlayer(localPlayerId);
 
-      // Queue admin cleanup work before the autoplay AI takes over.
-      this.runAutoplayAdminTasks();
+      // Prime the current autoplay run before the engine AI takes over.
+      this.setAutoplayStatus(
+        this.autoplayMasteryEnabled
+          ? `Autoplay: starting master mode for ${turns} turn${turns === 1 ? "" : "s"}…`
+          : `Autoplay: starting stock AI for ${turns} turn${turns === 1 ? "" : "s"}…`,
+      );
+      this.autoplayMasteryNeedsSetup = this.autoplayMasteryEnabled;
+      this.runAutoplayMasteryTasks("start");
 
       // Start autoplay.
       Autoplay.setActive(true);
@@ -3165,7 +3421,7 @@ export const Actions = new (class {
 
     try {
       // Grant exactly one wildcard point so the button matches its label and avoids absurd UI counts.
-      player.Identity.addWildcardAttributePoints?.(1);
+      player.Identity.addWildcardAttributePoints?.(1000);
     } catch (_error) {
       // Ignore and fall through to the verification / diagnostics below.
     }
