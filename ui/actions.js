@@ -719,6 +719,45 @@ export const Actions = new (class {
     };
   }
 
+  // Read one native-backed member that may be exposed as either a property or a zero-argument getter.
+  readNativeValue(target, propertyName, fallback = null) {
+    if (!target) {
+      return fallback;
+    }
+
+    let value;
+
+    try {
+      value = target[propertyName];
+    } catch (_error) {
+      return fallback;
+    }
+
+    if (typeof value === "function") {
+      try {
+        return value.call(target);
+      } catch (_error) {
+        return fallback;
+      }
+    }
+
+    return value ?? fallback;
+  }
+
+  // Normalize one native-backed numeric member so commander state checks never compare NaN forever.
+  readNativeNumber(target, propertyName, fallback = 0) {
+    const numericValue = Number(
+      this.readNativeValue(target, propertyName, fallback),
+    );
+
+    return Number.isFinite(numericValue) ? numericValue : fallback;
+  }
+
+  // Normalize one native-backed boolean member for queue decisions and progress snapshots.
+  readNativeBoolean(target, propertyName, fallback = false) {
+    return Boolean(this.readNativeValue(target, propertyName, fallback));
+  }
+
   // Collect callable method names from a native-backed game component for debugging/fallbacks.
   getCallablePropertyNames(target) {
     if (!target) {
@@ -873,13 +912,34 @@ export const Actions = new (class {
   // Snapshot the commander promotion state so we can tell whether an admin request actually changed anything.
   captureCommanderAdminState(commander, availableActions = null) {
     const actions = availableActions ?? this.getCommanderAdminActions(commander);
+    const experience = commander?.Experience;
 
     return {
-      promotionPoints: Number(commander?.Experience?.getStoredPromotionPoints ?? 0),
-      commendationPoints: Number(commander?.Experience?.getStoredCommendations ?? 0),
-      canPromote: Boolean(commander?.Experience?.canPromote),
+      promotionPoints: this.readNativeNumber(
+        experience,
+        "getStoredPromotionPoints",
+      ),
+      commendationPoints: this.readNativeNumber(
+        experience,
+        "getStoredCommendations",
+      ),
+      canPromote: this.readNativeBoolean(experience, "canPromote"),
       actionSignatures: actions.map((action) => this.getCommanderAdminActionSignature(action)),
     };
+  }
+
+  // Make sure one commander is really selected before asking the stock command system which upgrades are legal.
+  prepareCommanderForAdmin(unitId) {
+    if (!ComponentID.isValid(unitId)) {
+      return false;
+    }
+
+    if (this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+      return true;
+    }
+
+    this.ensureUnitSelected(unitId);
+    return this.isSameComponentId(this.getSelectedUnitId(), unitId);
   }
 
   // Compare two commander promotion snapshots to see whether the command actually advanced the unit.
@@ -1012,6 +1072,7 @@ export const Actions = new (class {
         this.reinforcementSweepRequested ||
         this.reinforcementInFlight ||
         this.commanderAdminInFlight ||
+        this.commanderAdminQueue.length > 0 ||
         this.manualCommanderPendingIds.length > 0
       ) {
         this.updateManualAdminStatus();
@@ -1061,7 +1122,11 @@ export const Actions = new (class {
     }
 
     if (this.manualCommanderUpgradeRequested) {
-      if (this.commanderAdminInFlight || this.manualCommanderPendingIds.length > 0) {
+      if (
+        this.commanderAdminInFlight ||
+        this.commanderAdminQueue.length > 0 ||
+        this.manualCommanderPendingIds.length > 0
+      ) {
         this.updateManualAdminStatus();
         return;
       }
@@ -1462,7 +1527,9 @@ export const Actions = new (class {
 
   // Collect every currently available promotion or commendation for a commander.
   getCommanderPromotionCandidates(commander) {
-    if (!commander?.Experience) {
+    const experience = commander?.Experience;
+
+    if (!experience) {
       return [];
     }
 
@@ -1472,10 +1539,14 @@ export const Actions = new (class {
       return [];
     }
 
+    if (!this.readNativeBoolean(experience, "canPromote")) {
+      return [];
+    }
+
     return this.getPromotionMetadataForClass(unitDefinition.PromotionClass).filter(
       (candidate) => {
         if (
-          commander.Experience.hasPromotion(
+          experience.hasPromotion(
             candidate.disciplineType,
             candidate.promotionType,
           )
@@ -1484,8 +1555,7 @@ export const Actions = new (class {
         }
 
         return Boolean(
-          commander.Experience.canPromote &&
-          commander.Experience.canEarnPromotion(
+          experience.canEarnPromotion(
             candidate.disciplineType,
             candidate.promotionType,
             false,
@@ -1560,6 +1630,14 @@ export const Actions = new (class {
         continue;
       }
 
+      this.manualCommanderCurrentName = this.getUnitDisplayName(commander);
+
+      if (!this.prepareCommanderForAdmin(commander.id)) {
+        this.updateManualAdminStatus();
+        this.scheduleCommanderAdminProcessing();
+        return;
+      }
+
       const availableActions = this.getCommanderAdminActions(commander);
 
       if (availableActions.length <= 0) {
@@ -1572,7 +1650,6 @@ export const Actions = new (class {
         continue;
       }
 
-      this.manualCommanderCurrentName = this.getUnitDisplayName(commander);
       const beforeState = this.captureCommanderAdminState(
         commander,
         availableActions,
@@ -1677,33 +1754,27 @@ export const Actions = new (class {
 
   // Queue every commander that can currently spend promotions, commendations, or army upgrades.
   upgradeSelectedCommander() {
-    const commandersWithActions = this.getCommanderUnits().filter((commander) =>
-      Boolean(this.getNextCommanderAdminAction(commander)),
-    );
+    const commanders = this.getCommanderUnits();
 
-    if (commandersWithActions.length <= 0) {
+    if (commanders.length <= 0) {
       this.manualCommanderUpgradeRequested = false;
       this.resetManualCommanderProgress();
-      this.setCommanderStatus("No commanders have upgrades available.");
-      console.log("Dev panel: no commanders have upgrades available.");
+      this.setCommanderStatus("No local commanders found.");
+      console.log("Dev panel: no local commanders found.");
       this.scheduleCommanderStatusReset();
       return;
     }
 
     this.manualCommanderUpgradeRequested = true;
-    this.beginManualCommanderProgress(
-      commandersWithActions.map((commander) => commander.id),
-    );
+    this.beginManualCommanderProgress(commanders.map((commander) => commander.id));
     this.setCommanderStatus(
-      `Upgrading commanders… 0/${commandersWithActions.length} done, ${commandersWithActions.length} left, 0 actions sent`,
+      `Upgrading commanders… 0/${commanders.length} done, ${commanders.length} left, 0 actions sent`,
     );
     console.log(
-      `Dev panel: upgrading ${commandersWithActions.length} commander(s).`,
+      `Dev panel: scanning ${commanders.length} commander(s) for upgrades.`,
     );
 
-    commandersWithActions.forEach((commander) => {
-      this.enqueueCommanderForAdmin(commander.id);
-    });
+    this.enqueueAllCommandersForAdmin();
 
     this.processAdminQueues();
   }
