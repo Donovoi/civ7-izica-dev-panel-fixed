@@ -652,6 +652,143 @@ export const Actions = new (class {
     }
   }
 
+  // Try to focus the stock unit-actions panel so command requests have the same UI context as a manual click.
+  focusUnitActionsPanel() {
+    const selectors = [
+      ".unit-actions [tabindex]",
+      ".unit-actions fxs-activatable",
+      ".unit-actions",
+      "unit-actions [tabindex]",
+      "unit-actions fxs-activatable",
+      "unit-actions",
+      "[data-context='unit-actions'] [tabindex]",
+      "[data-context='unit-actions'] fxs-activatable",
+      "[data-context='unit-actions']",
+    ];
+
+    for (const selector of selectors) {
+      const element = document.querySelector(selector);
+
+      if (!(element instanceof HTMLElement)) {
+        continue;
+      }
+
+      element.dispatchEvent(new Event("mouseenter"));
+      element.dispatchEvent(new Event("focus"));
+      element.focus?.();
+      return true;
+    }
+
+    return false;
+  }
+
+  // Restore the previous unit selection after one delayed stock-command attempt finishes.
+  restoreTemporaryUnitSelection(unitId, previousSelectionId, alreadySelected) {
+    if (alreadySelected) {
+      return;
+    }
+
+    requestAnimationFrame(() => {
+      if (!this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+        return;
+      }
+
+      if (previousSelectionId && Units.get(previousSelectionId)) {
+        UI.Player.selectUnit?.(previousSelectionId);
+      }
+    });
+  }
+
+  // Try one stock unit command again after the selection/UI focus has had a frame to catch up.
+  sendUnitCommandAfterSelectionSettles(unitId, commandType, args) {
+    if (!ComponentID.isValid(unitId)) {
+      return false;
+    }
+
+    const previousSelectionId = this.getSelectedUnitId();
+    const alreadySelected = this.isSameComponentId(previousSelectionId, unitId);
+
+    if (!alreadySelected) {
+      this.ensureUnitSelected(unitId);
+    }
+
+    if (!this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+      return false;
+    }
+
+    const unitLabel = this.getUnitDisplayName(unitId);
+    const maxAttempts = 3;
+    let attemptCount = 0;
+    const releaseCommanderRetry = () => {
+      if (!this.isSameComponentId(this.commanderAdminInFlight?.unitId, unitId)) {
+        return;
+      }
+
+      this.commanderAdminInFlight = null;
+      this.scheduleCommanderAdminProcessing();
+    };
+
+    const attemptSend = () => {
+      attemptCount += 1;
+
+      if (!this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+        if (attemptCount < maxAttempts) {
+          this.ensureUnitSelected(unitId);
+          requestAnimationFrame(attemptSend);
+          return;
+        }
+
+        console.log(
+          `Dev panel: could not keep ${unitLabel} selected long enough for ${commandType}.`,
+        );
+        this.restoreTemporaryUnitSelection(
+          unitId,
+          previousSelectionId,
+          alreadySelected,
+        );
+        releaseCommanderRetry();
+        return;
+      }
+
+      this.focusUnitActionsPanel();
+
+      const preparedResult = Game.UnitCommands?.canStart(
+        unitId,
+        commandType,
+        args,
+        false,
+      );
+
+      if (preparedResult?.Success) {
+        Game.UnitCommands?.sendRequest(unitId, commandType, args);
+        this.restoreTemporaryUnitSelection(
+          unitId,
+          previousSelectionId,
+          alreadySelected,
+        );
+        return;
+      }
+
+      if (attemptCount < maxAttempts) {
+        requestAnimationFrame(attemptSend);
+        return;
+      }
+
+      console.log(
+        `Dev panel: ${commandType} stayed unavailable for ${unitLabel} after waiting for unit-actions focus.`,
+      );
+      this.restoreTemporaryUnitSelection(
+        unitId,
+        previousSelectionId,
+        alreadySelected,
+      );
+      releaseCommanderRetry();
+    };
+
+    requestAnimationFrame(attemptSend);
+    return true;
+  }
+
   // Ask the stock command system whether a command can start, borrowing selection only when requested.
   canStartUnitCommand(unitId, commandType, args, allowTemporarySelection = false) {
     const directResult = Game.UnitCommands?.canStart(
@@ -681,23 +818,7 @@ export const Actions = new (class {
       return true;
     }
 
-    return Boolean(
-      this.withTemporaryUnitSelection(unitId, () => {
-        const selectedResult = Game.UnitCommands?.canStart(
-          unitId,
-          commandType,
-          args,
-          false,
-        );
-
-        if (!selectedResult?.Success) {
-          return false;
-        }
-
-        Game.UnitCommands?.sendRequest(unitId, commandType, args);
-        return true;
-      }),
-    );
+    return this.sendUnitCommandAfterSelectionSettles(unitId, commandType, args);
   }
 
   // Register the autoplay/admin listeners exactly once.
@@ -1850,6 +1971,24 @@ export const Actions = new (class {
     };
   }
 
+  // Check whether one commander XP snapshot visibly advanced level-up progress.
+  hasCommanderXpGrantAdvanced(beforeState, afterState) {
+    return (
+      afterState.storedPromotionPoints > beforeState.storedPromotionPoints ||
+      afterState.storedCommendations > beforeState.storedCommendations ||
+      afterState.level > beforeState.level
+    );
+  }
+
+  // Check whether one commander XP snapshot changed any of the native-backed XP counters at all.
+  hasCommanderXpGrantStateChanged(beforeState, afterState) {
+    return (
+      this.hasCommanderXpGrantAdvanced(beforeState, afterState) ||
+      afterState.experiencePoints !== beforeState.experiencePoints ||
+      afterState.experienceToNextLevel !== beforeState.experienceToNextLevel
+    );
+  }
+
   // Top a commander up only to the highest remaining regular-promotion point total so native counters never overflow.
   grantCommanderSafeXp(unitOrId) {
     const commander = ComponentID.isValid(unitOrId)
@@ -1916,14 +2055,28 @@ export const Actions = new (class {
 
       Units.changeExperience(liveCommander.id, xpNeededForNextLevel);
 
-      const afterState = this.captureCommanderXpGrantState(
+      let afterState = this.captureCommanderXpGrantState(
         Units.get(liveCommander.id) ?? liveCommander,
       );
 
       if (
-        afterState.storedPromotionPoints <= beforeState.storedPromotionPoints &&
-        afterState.level <= beforeState.level
+        !this.hasCommanderXpGrantAdvanced(beforeState, afterState) &&
+        this.hasCommanderXpGrantStateChanged(beforeState, afterState)
       ) {
+        const fallbackXpGrant = Math.max(
+          Math.ceil(afterState.experienceToNextLevel),
+          1,
+        );
+
+        if (fallbackXpGrant !== xpNeededForNextLevel) {
+          Units.changeExperience(liveCommander.id, fallbackXpGrant);
+          afterState = this.captureCommanderXpGrantState(
+            Units.get(liveCommander.id) ?? liveCommander,
+          );
+        }
+      }
+
+      if (!this.hasCommanderXpGrantStateChanged(beforeState, afterState)) {
         break;
       }
     }
