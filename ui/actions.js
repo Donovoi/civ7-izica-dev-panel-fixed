@@ -131,7 +131,8 @@ export const Actions = new (class {
     "reinforce-all-units": "Send every eligible land, sea, and air unit to a valid commander.",
     "toggle-infinite-movement": "Toggle infinite movement for your units.",
     "heal-units": "Heal every alive player's unit, including packed and traveling units when possible.",
-    "add-xp": "Grant 10,000,000 XP to every local unit.",
+    "add-xp": "Grant max safe XP to every local unit. Regular units still get a huge XP boost, but commanders stop at their remaining promotion-point cap to avoid overflowing native counters.",
+    "clear-all-logs": "Clear the mirrored dev console buffer and every stored profiler session log so the next repro starts from a clean slate.",
     "sleep-all-units": "Put every local unit to sleep.",
     "complete-tech": "Finish the active technology.",
     "complete-civic": "Finish the active civic.",
@@ -176,6 +177,7 @@ export const Actions = new (class {
     this.toggleFastGameplay = this.toggleFastGameplay.bind(this);
     this.togglePerformanceProfiler = this.togglePerformanceProfiler.bind(this);
     this.copyAllLogs = this.copyAllLogs.bind(this);
+    this.clearAllLogs = this.clearAllLogs.bind(this);
     this.completeTech = this.completeTech.bind(this);
     this.completeCivic = this.completeCivic.bind(this);
     this.completeAllResearchAndCivics = this.completeAllResearchAndCivics.bind(this);
@@ -243,6 +245,9 @@ export const Actions = new (class {
 
       // Copy the persisted profiler session log plus the mirrored dev console buffer to the clipboard.
       "copy-all-logs": this.copyAllLogs,
+
+      // Clear the mirrored dev console buffer and every stored profiler session log.
+      "clear-all-logs": this.clearAllLogs,
 
       // Queue autoplay for 1 turn.
       "autoplay-1": this.startAutoplay(1),
@@ -1728,6 +1733,158 @@ export const Actions = new (class {
     return metadata;
   }
 
+  // Collect every non-commendation promotion node a commander can ever spend regular promotion points on.
+  getCommanderPrimaryPromotionMetadata(commander) {
+    const unitDefinition = GameInfo.Units.lookup(commander?.type);
+    const promotionClassType = unitDefinition?.PromotionClass;
+
+    if (!promotionClassType) {
+      return [];
+    }
+
+    return this.getPromotionMetadataForClass(promotionClassType).filter(
+      (candidate) => !candidate.promotion?.Commendation,
+    );
+  }
+
+  // Count how many regular promotion nodes this commander still has not purchased.
+  getCommanderRemainingPromotionCount(commander) {
+    const experience = commander?.Experience;
+
+    if (!experience) {
+      return 0;
+    }
+
+    return this.getCommanderPrimaryPromotionMetadata(commander).filter(
+      (candidate) =>
+        !experience.hasPromotion(
+          candidate.disciplineType,
+          candidate.promotionType,
+        ),
+    ).length;
+  }
+
+  // Snapshot the commander XP state used by the safe commander XP grant path.
+  captureCommanderXpGrantState(commander) {
+    const experience = commander?.Experience;
+
+    return {
+      level: this.readNativeNumber(experience, "getLevel"),
+      experiencePoints: this.readNativeNumber(experience, "experiencePoints"),
+      experienceToNextLevel: this.readNativeNumber(
+        experience,
+        "experienceToNextLevel",
+      ),
+      storedPromotionPoints: this.readNativeNumber(
+        experience,
+        "getStoredPromotionPoints",
+      ),
+      storedCommendations: this.readNativeNumber(
+        experience,
+        "getStoredCommendations",
+      ),
+      remainingPromotionCount: this.getCommanderRemainingPromotionCount(
+        commander,
+      ),
+    };
+  }
+
+  // Top a commander up only to the highest remaining regular-promotion point total so native counters never overflow.
+  grantCommanderSafeXp(unitOrId) {
+    const commander = ComponentID.isValid(unitOrId)
+      ? Units.get(unitOrId)
+      : unitOrId;
+
+    if (!commander?.isCommanderUnit) {
+      return {
+        didChange: false,
+        reason: "not-commander",
+      };
+    }
+
+    const initialState = this.captureCommanderXpGrantState(commander);
+    const targetPromotionPoints = initialState.remainingPromotionCount;
+
+    if (targetPromotionPoints <= 0) {
+      return {
+        didChange: false,
+        reason: "no-promotions-left",
+        initialState,
+        finalState: initialState,
+      };
+    }
+
+    if (initialState.storedPromotionPoints >= targetPromotionPoints) {
+      return {
+        didChange: false,
+        reason: "already-capped",
+        initialState,
+        finalState: initialState,
+      };
+    }
+
+    const maxIterations = Math.max(
+      targetPromotionPoints - initialState.storedPromotionPoints,
+      0,
+    ) + 2;
+
+    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+      const liveCommander = Units.get(commander.id) ?? commander;
+      const beforeState = this.captureCommanderXpGrantState(liveCommander);
+
+      if (
+        beforeState.remainingPromotionCount <= 0 ||
+        beforeState.storedPromotionPoints >= beforeState.remainingPromotionCount
+      ) {
+        break;
+      }
+
+      if (
+        !Number.isFinite(beforeState.experienceToNextLevel) ||
+        beforeState.experienceToNextLevel <= 0
+      ) {
+        break;
+      }
+
+      const xpNeededForNextLevel = Math.max(
+        Math.ceil(
+          beforeState.experienceToNextLevel - beforeState.experiencePoints,
+        ),
+        1,
+      );
+
+      Units.changeExperience(liveCommander.id, xpNeededForNextLevel);
+
+      const afterState = this.captureCommanderXpGrantState(
+        Units.get(liveCommander.id) ?? liveCommander,
+      );
+
+      if (
+        afterState.storedPromotionPoints <= beforeState.storedPromotionPoints &&
+        afterState.level <= beforeState.level
+      ) {
+        break;
+      }
+    }
+
+    const finalState = this.captureCommanderXpGrantState(
+      Units.get(commander.id) ?? commander,
+    );
+
+    return {
+      didChange:
+        finalState.storedPromotionPoints !== initialState.storedPromotionPoints ||
+        finalState.level !== initialState.level ||
+        finalState.experiencePoints !== initialState.experiencePoints,
+      reason:
+        finalState.storedPromotionPoints >= finalState.remainingPromotionCount
+          ? "capped"
+          : "partial",
+      initialState,
+      finalState,
+    };
+  }
+
   // Collect every currently available promotion or commendation for a commander.
   getCommanderPromotionCandidates(commander) {
     const experience = commander?.Experience;
@@ -2469,6 +2626,19 @@ export const Actions = new (class {
 
     this.setPerformanceStatus("Clipboard unavailable; dumped combined debug log into the browser console.");
     console.log(`Dev panel: combined debug log dump follows.\n${formattedLog}`);
+  }
+
+  // Clear the mirrored dev console buffer and every stored profiler session log.
+  clearAllLogs() {
+    Logs.clear();
+    Storage.setQuietly("dev-panel-profiler-sessions", {});
+    this.performanceProfilerSessionKey = "";
+    this.performanceProfilerSessionName = "";
+    this.setPerformanceStatus(
+      this.performanceProfilerEnabled
+        ? "Logs cleared. Profiler will start filling new entries again while it stays enabled."
+        : "Logs cleared.",
+    );
   }
 
   // Describe the current UI/gameplay context around a profiler sample so hitch logs are easier to interpret later.
@@ -3656,11 +3826,37 @@ export const Actions = new (class {
   }
 
   addXp() {
+    let regularUnitsBoosted = 0;
+    let commandersCapped = 0;
+    let commandersAlreadyCapped = 0;
+    let commandersPartiallyCapped = 0;
+
     // Iterate over a safe unit list so this action does nothing instead of crashing.
     for (const unit of this.getLocalUnits()) {
-      // Grant a huge amount of experience so units level immediately.
+      if (unit?.isCommanderUnit) {
+        const result = this.grantCommanderSafeXp(unit);
+
+        if (result.didChange) {
+          if (result.reason === "capped") {
+            commandersCapped += 1;
+          } else {
+            commandersPartiallyCapped += 1;
+          }
+        } else {
+          commandersAlreadyCapped += 1;
+        }
+
+        continue;
+      }
+
+      // Grant a huge amount of experience so non-command units level immediately.
       Units.changeExperience(unit.id, 10000000);
+      regularUnitsBoosted += 1;
     }
+
+    console.log(
+      `Dev panel: max safe XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersCapped} commander(s) filled to their promotion cap, ${commandersPartiallyCapped} commander(s) advanced partway, ${commandersAlreadyCapped} commander(s) already at cap.`,
+    );
   }
 
   sleepAllUnits() {
