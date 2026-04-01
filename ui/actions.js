@@ -87,6 +87,32 @@ export const Actions = new (class {
   // Collapse duplicate mastery bursts when the same autoplay start fires multiple nearby events.
   autoplayMasteryLastRunAt = 0;
 
+  // Track the number of local-player autoplay turns processed in the current run.
+  autoplayMasteryTurnCounter = 0;
+
+  // Store the currently selected victory-bias helper mode for mastery-backed autoplay.
+  autoplayMasteryBias = "balanced";
+
+  // Keep the supported autoplay mastery bias modes in one place for labels, validation, and cycling.
+  autoplayMasteryBiasModes = [
+    {
+      key: "balanced",
+      label: "Balanced",
+    },
+    {
+      key: "domination",
+      label: "Domination",
+    },
+    {
+      key: "science",
+      label: "Science",
+    },
+    {
+      key: "expansion",
+      label: "Expansion",
+    },
+  ];
+
   // Track whether the fast-gameplay option bundle is currently enabled through the dev panel.
   fastGameplayEnabled = false;
 
@@ -147,6 +173,7 @@ export const Actions = new (class {
     "complete-civic": "Finish the active civic.",
     "complete-all-research-civics": "Finish every remaining technology and civic, auto-pick the next node each time, and stop once Future Tech and Future Civic are selected.",
     "toggle-autoplay-mastery": "Toggle a cheat-assisted autoplay helper that reveals the map, forces first contact, boosts the local economy and production, heals and buffs units, maxes out research, and keeps commander admin automation running. This makes autoplay far stronger, but it is not a true engine-level forward-search AI.",
+    "cycle-autoplay-bias": "Cycle the victory-bias package used by master autoplay. Balanced keeps the broad support bundle, Domination re-buffs armies harder, Science leans into growth plus full progression, and Expansion pushes settlers, growth, and production harder.",
     "autoplay-1": "Start autoplay for 1 turn. When Master mode is enabled, autoplay also gets aggressive research, economy, production, healing, and commander-support boosts.",
     "autoplay-5": "Start autoplay for 5 turns. When Master mode is enabled, autoplay also gets aggressive research, economy, production, healing, and commander-support boosts.",
     "autoplay-10": "Start autoplay for 10 turns. When Master mode is enabled, autoplay also gets aggressive research, economy, production, healing, and commander-support boosts.",
@@ -192,6 +219,7 @@ export const Actions = new (class {
     this.completeCivic = this.completeCivic.bind(this);
     this.completeAllResearchAndCivics = this.completeAllResearchAndCivics.bind(this);
     this.toggleAutoplayMastery = this.toggleAutoplayMastery.bind(this);
+    this.cycleAutoplayMasteryBias = this.cycleAutoplayMasteryBias.bind(this);
     this.healUnits = this.healUnits.bind(this);
     this.addXp = this.addXp.bind(this);
     this.sleepAllUnits = this.sleepAllUnits.bind(this);
@@ -262,6 +290,9 @@ export const Actions = new (class {
 
       // Toggle the cheat-assisted autoplay mastery helper.
       "toggle-autoplay-mastery": this.toggleAutoplayMastery,
+
+      // Cycle the victory-bias package used by mastery-backed autoplay.
+      "cycle-autoplay-bias": this.cycleAutoplayMasteryBias,
 
       // Queue autoplay for 1 turn.
       "autoplay-1": this.startAutoplay(1),
@@ -2090,6 +2121,37 @@ export const Actions = new (class {
     return storedValue === null ? true : Boolean(storedValue);
   }
 
+  // Normalize any stored / requested autoplay mastery bias to one of the supported modes.
+  normalizeAutoplayMasteryBias(bias) {
+    const normalizedBias = `${bias ?? ""}`.trim().toLowerCase();
+
+    return this.autoplayMasteryBiasModes.some((mode) => mode.key === normalizedBias)
+      ? normalizedBias
+      : "balanced";
+  }
+
+  // Read the persisted victory-bias preference for mastery-backed autoplay.
+  getAutoplayMasteryBias() {
+    return this.normalizeAutoplayMasteryBias(
+      Storage.get("dev-panel-autoplay-bias"),
+    );
+  }
+
+  // Resolve the config record for the current or requested autoplay mastery bias.
+  getAutoplayMasteryBiasConfig(bias = this.autoplayMasteryBias) {
+    const normalizedBias = this.normalizeAutoplayMasteryBias(bias);
+
+    return (
+      this.autoplayMasteryBiasModes.find((mode) => mode.key === normalizedBias) ??
+      this.autoplayMasteryBiasModes[0]
+    );
+  }
+
+  // Resolve the user-facing label for the current or requested autoplay mastery bias.
+  getAutoplayMasteryBiasLabel(bias = this.autoplayMasteryBias) {
+    return this.getAutoplayMasteryBiasConfig(bias).label;
+  }
+
   // Update the autoplay mastery toggle button label.
   updateAutoplayMasteryLabel() {
     const label = document.querySelector(
@@ -2103,12 +2165,25 @@ export const Actions = new (class {
     }
   }
 
+  // Update the autoplay mastery bias button label.
+  updateAutoplayMasteryBiasLabel() {
+    const label = document.querySelector(
+      ".dev-panel-button__label--cycle-autoplay-bias",
+    );
+
+    if (label) {
+      label.textContent = `Bias: ${this.getAutoplayMasteryBiasLabel()}`;
+    }
+  }
+
   // Keep the autoplay status line aligned with the current mode when no richer message is active.
   syncAutoplayStatus() {
+    const biasLabel = this.getAutoplayMasteryBiasLabel();
+
     if (Autoplay.isActive) {
       this.setAutoplayStatus(
         this.autoplayMasteryEnabled
-          ? "Autoplay: master mode running."
+          ? `Autoplay: ${biasLabel} master mode running.`
           : "Autoplay: stock AI + admin running.",
       );
       return;
@@ -2116,7 +2191,7 @@ export const Actions = new (class {
 
     this.setAutoplayStatus(
       this.autoplayMasteryEnabled
-        ? "Autoplay: master mode armed."
+        ? `Autoplay: master mode armed (${biasLabel}).`
         : "Autoplay: stock AI + admin only.",
     );
   }
@@ -2142,6 +2217,28 @@ export const Actions = new (class {
     );
   }
 
+  // Cycle the victory-bias mode used by mastery-backed autoplay.
+  cycleAutoplayMasteryBias() {
+    const currentIndex = this.autoplayMasteryBiasModes.findIndex(
+      (mode) => mode.key === this.normalizeAutoplayMasteryBias(this.autoplayMasteryBias),
+    );
+    const nextMode =
+      this.autoplayMasteryBiasModes[
+      (currentIndex + 1) % this.autoplayMasteryBiasModes.length
+      ] ?? this.autoplayMasteryBiasModes[0];
+
+    this.autoplayMasteryBias = nextMode.key;
+    Storage.set("dev-panel-autoplay-bias", nextMode.key);
+    this.updateAutoplayMasteryBiasLabel();
+    this.syncAutoplayStatus();
+
+    if (this.autoplayMasteryEnabled && Autoplay.isActive) {
+      this.runAutoplayMasteryTasks("bias");
+    }
+
+    console.log(`Dev panel: autoplay victory bias -> ${nextMode.label}.`);
+  }
+
   // Check whether autoplay still needs to push the player onto Future Tech / Future Civic.
   shouldPrimeAutoplayMasteryResearch(player = this.getLocalPlayer()) {
     if (!player || this.progressionAutomationRequested) {
@@ -2152,11 +2249,11 @@ export const Actions = new (class {
     const civicBranch = this.getProgressionBranchState("civic", player);
     const techAtRepeatable = Boolean(
       techBranch?.activeNodeType &&
-        this.isRepeatableProgressionNode(techBranch.activeNodeType),
+      this.isRepeatableProgressionNode(techBranch.activeNodeType),
     );
     const civicAtRepeatable = Boolean(
       civicBranch?.activeNodeType &&
-        this.isRepeatableProgressionNode(civicBranch.activeNodeType),
+      this.isRepeatableProgressionNode(civicBranch.activeNodeType),
     );
 
     return !techAtRepeatable || !civicAtRepeatable;
@@ -2188,6 +2285,116 @@ export const Actions = new (class {
 
     Units.changeExperience(unit.id, 10000000);
     return true;
+  }
+
+  // Count how many local units currently match one unit type.
+  getLocalUnitCountByType(unitType) {
+    if (!unitType) {
+      return 0;
+    }
+
+    return this.getLocalUnits().filter((unit) => unit?.type === unitType).length;
+  }
+
+  // Spawn one settler at the capital without stealing selection or camera focus from autoplay.
+  spawnSettlerForAutoplay() {
+    const localPlayerId = this.getLocalPlayerId();
+    const capitalLocation = this.getLocalPlayer()?.Cities?.getCapital?.()?.location;
+
+    if (localPlayerId === null || !capitalLocation) {
+      return false;
+    }
+
+    Game.PlayerOperations.sendRequest(localPlayerId, "CREATE_ELEMENT", {
+      IndependentIndex: -1,
+      Kind: "UNIT",
+      Location: capitalLocation,
+      Owner: localPlayerId,
+      Type: "UNIT_SETTLER",
+    });
+
+    return true;
+  }
+
+  // Decide whether the expansion bias should inject another settler this turn.
+  shouldSpawnAutoplayExpansionSettler(cityCount, settlerCount, needsSetup) {
+    if (cityCount <= 0 || cityCount >= 10 || settlerCount >= 2) {
+      return false;
+    }
+
+    if (needsSetup) {
+      return true;
+    }
+
+    if (this.autoplayMasteryTurnCounter <= 0) {
+      return false;
+    }
+
+    return this.autoplayMasteryTurnCounter % (cityCount < 4 ? 2 : 3) === 0;
+  }
+
+  // Apply the extra support bundle for the current autoplay victory bias.
+  applyAutoplayMasteryBiasSupport(player, context) {
+    const biasKey = this.normalizeAutoplayMasteryBias(this.autoplayMasteryBias);
+    const summary = {
+      populationBursts: 0,
+      settlersSpawned: 0,
+      extraRegularUnitsBuffed: 0,
+      extraCommandersPrimed: 0,
+      forcedResearchSweep: false,
+    };
+
+    switch (biasKey) {
+      case "domination": {
+        this.addHappiness();
+        this.startGoldenAge();
+
+        if (!context.needsSetup && this.autoplayMasteryTurnCounter % 3 === 0) {
+          const rebuffSummary = this.primeAutoplayMasteryUnits();
+
+          summary.extraRegularUnitsBuffed += rebuffSummary.regularUnitsBuffed;
+          summary.extraCommandersPrimed += rebuffSummary.commandersPrimed;
+        }
+
+        break;
+      }
+
+      case "science": {
+        this.addPopulation();
+        summary.populationBursts += context.cityCount;
+        summary.forcedResearchSweep = true;
+        break;
+      }
+
+      case "expansion": {
+        this.addPopulation();
+        summary.populationBursts += context.cityCount;
+
+        if (
+          this.shouldSpawnAutoplayExpansionSettler(
+            context.cityCount,
+            context.settlerCount,
+            context.needsSetup,
+          ) &&
+          this.spawnSettlerForAutoplay()
+        ) {
+          summary.settlersSpawned += 1;
+        }
+
+        break;
+      }
+
+      default: {
+        if (context.needsSetup) {
+          this.addPopulation();
+          summary.populationBursts += context.cityCount;
+        }
+
+        break;
+      }
+    }
+
+    return summary;
   }
 
   // Prime every current local unit once at the start of a mastery-backed autoplay run.
@@ -2245,6 +2452,7 @@ export const Actions = new (class {
 
     const now = Date.now();
     const needsSetup = this.autoplayMasteryNeedsSetup;
+    const biasLabel = this.getAutoplayMasteryBiasLabel();
 
     if (!needsSetup && now - this.autoplayMasteryLastRunAt < 800) {
       return;
@@ -2258,17 +2466,28 @@ export const Actions = new (class {
       this.meetAll();
       this.addHappiness();
       this.startGoldenAge();
-      this.addPopulation();
     }
 
     const cityCount = this.getLocalCities().length;
+    const settlerCount = this.getLocalUnitCountByType("UNIT_SETTLER");
     const buffSummary = needsSetup
       ? this.primeAutoplayMasteryUnits()
       : {
         regularUnitsBuffed: 0,
         commandersPrimed: this.primeAutoplayMasteryCommanders(),
       };
-    const shouldPrimeResearch = this.shouldPrimeAutoplayMasteryResearch(player);
+    const biasSummary = this.applyAutoplayMasteryBiasSupport(player, {
+      needsSetup,
+      cityCount,
+      settlerCount,
+      reason,
+    });
+    const shouldPrimeResearch =
+      this.shouldPrimeAutoplayMasteryResearch(player) &&
+      (biasSummary.forcedResearchSweep ||
+        this.autoplayMasteryBias !== "domination" ||
+        needsSetup ||
+        this.autoplayMasteryTurnCounter % 4 === 0);
 
     this.completeProduction();
     this.addGold();
@@ -2283,11 +2502,11 @@ export const Actions = new (class {
 
     this.setAutoplayStatus(
       needsSetup
-        ? `Autoplay: master setup ran — map revealed, contacts forced, ${cityCount} cities primed, ${buffSummary.regularUnitsBuffed} regular units buffed, ${buffSummary.commandersPrimed} commanders primed${shouldPrimeResearch ? ", research sweep armed" : ""}.`
-        : `Autoplay: master upkeep ran — production, economy, healing, ${buffSummary.commandersPrimed} commanders primed${shouldPrimeResearch ? ", research sweep armed" : ""}.`,
+        ? `Autoplay: ${biasLabel} setup ran — ${cityCount} cities, ${buffSummary.regularUnitsBuffed + biasSummary.extraRegularUnitsBuffed} regular units buffed, ${buffSummary.commandersPrimed + biasSummary.extraCommandersPrimed} commanders primed${biasSummary.populationBursts > 0 ? `, +pop to ${biasSummary.populationBursts} city slots` : ""}${biasSummary.settlersSpawned > 0 ? `, ${biasSummary.settlersSpawned} settler spawned` : ""}${shouldPrimeResearch ? ", research sweep armed" : ""}.`
+        : `Autoplay: ${biasLabel} upkeep ran — production, economy, healing, ${buffSummary.commandersPrimed + biasSummary.extraCommandersPrimed} commanders primed${biasSummary.extraRegularUnitsBuffed > 0 ? `, ${biasSummary.extraRegularUnitsBuffed} regular units re-buffed` : ""}${biasSummary.populationBursts > 0 ? `, +pop to ${biasSummary.populationBursts} city slots` : ""}${biasSummary.settlersSpawned > 0 ? `, ${biasSummary.settlersSpawned} settler spawned` : ""}${shouldPrimeResearch ? ", research sweep armed" : ""}.`,
     );
     console.log(
-      `Dev panel: autoplay master ${needsSetup ? "setup" : reason} complete (cities=${cityCount}, regularUnits=${buffSummary.regularUnitsBuffed}, commanders=${buffSummary.commandersPrimed}, research=${shouldPrimeResearch ? "primed" : "steady"}).`,
+      `Dev panel: autoplay ${biasLabel.toLowerCase()} master ${needsSetup ? "setup" : reason} complete (turn=${this.autoplayMasteryTurnCounter}, cities=${cityCount}, settlers=${settlerCount}, regularUnits=${buffSummary.regularUnitsBuffed + biasSummary.extraRegularUnitsBuffed}, commanders=${buffSummary.commandersPrimed + biasSummary.extraCommandersPrimed}, populationBursts=${biasSummary.populationBursts}, spawnedSettlers=${biasSummary.settlersSpawned}, research=${shouldPrimeResearch ? "primed" : "steady"}).`,
     );
   }
 
@@ -2343,6 +2562,8 @@ export const Actions = new (class {
 
   // Start a fresh autoplay admin sweep when autoplay begins.
   onAutoplayStarted() {
+    this.autoplayMasteryTurnCounter = 0;
+
     if (this.autoplayMasteryEnabled && Date.now() - this.autoplayMasteryLastRunAt > 1000) {
       this.autoplayMasteryNeedsSetup = true;
     }
@@ -2358,6 +2579,7 @@ export const Actions = new (class {
       return;
     }
 
+    this.autoplayMasteryTurnCounter += 1;
     this.runAutoplayMasteryTasks("turn");
   }
 
@@ -2567,7 +2789,9 @@ export const Actions = new (class {
     this.applyFastGameplaySettings(this.isFastGameplayEnabled());
     this.updatePerformanceProfilerLabel();
     this.autoplayMasteryEnabled = this.isAutoplayMasteryEnabled();
+    this.autoplayMasteryBias = this.getAutoplayMasteryBias();
     this.updateAutoplayMasteryLabel();
+    this.updateAutoplayMasteryBiasLabel();
 
     if (this.performanceProfilerEnabled) {
       this.setPerformanceStatus("Profiler: sampling frame times…");
@@ -3234,9 +3458,10 @@ export const Actions = new (class {
       Autoplay.setObserveAsPlayer(localPlayerId);
 
       // Prime the current autoplay run before the engine AI takes over.
+      this.autoplayMasteryTurnCounter = 0;
       this.setAutoplayStatus(
         this.autoplayMasteryEnabled
-          ? `Autoplay: starting master mode for ${turns} turn${turns === 1 ? "" : "s"}…`
+          ? `Autoplay: starting ${this.getAutoplayMasteryBiasLabel()} master mode for ${turns} turn${turns === 1 ? "" : "s"}…`
           : `Autoplay: starting stock AI for ${turns} turn${turns === 1 ? "" : "s"}…`,
       );
       this.autoplayMasteryNeedsSetup = this.autoplayMasteryEnabled;
