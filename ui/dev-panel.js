@@ -14,6 +14,7 @@ class DevPanel extends Panel {
     }
 
     onAttach() {
+        Actions.migratePanelLayout();
         Actions.updateFontSize();
         Actions.updatePositionLeft();
         Console.toggle(true);
@@ -50,10 +51,10 @@ window.addEventListener(InterfaceModeChangedEventName, (data) => {
 
 Controls.define('dev-panel', {
     createInstance: DevPanel,
-    description:    '',
-    classNames:     ["dev-panel"],
-    content:        ['fs://game/base-standard/ui/dev-panel.html'],
-    tabIndex:       -1,
+    description: '',
+    classNames: ["dev-panel"],
+    content: ['fs://game/base-standard/ui/dev-panel.html'],
+    tabIndex: -1,
 });
 
 

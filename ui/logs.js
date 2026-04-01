@@ -1,11 +1,22 @@
 export const Logs = new class {
     logs = [];
+    maxEntries = 250;
 
     constructor() {
         this.add = this.add.bind(this);
+        this.getEntries = this.getEntries.bind(this);
+        this.getText = this.getText.bind(this);
         this.render = this.render.bind(this);
         this.restore = this.restore.bind(this);
         this.clear = this.clear.bind(this);
+    }
+
+    getEntries() {
+        return [...this.logs];
+    }
+
+    getText() {
+        return this.logs.join('\n');
     }
 
     add(entry) {
@@ -15,8 +26,15 @@ export const Logs = new class {
 
         this.logs.push(entry);
 
-        this.render(entry);
-        console?.scrollToBottom();
+        while (this.logs.length > this.maxEntries) {
+            this.logs.shift();
+        }
+
+        const consoleVisible = document.querySelector('.dev-panel-console')?.classList.contains('dev-panel-console--visible');
+        if (consoleVisible) {
+            this.render(entry);
+            console?.scrollToBottom();
+        }
     }
 
     render(entry) {
@@ -26,8 +44,13 @@ export const Logs = new class {
         }
 
         const row = document.createElement('div');
-        row.innerHTML = entry;
+        row.textContent = entry;
         element.appendChild(row);
+
+        while (element.children.length > this.maxEntries) {
+            element.removeChild(element.firstChild);
+        }
+
         console?.scrollToBottom();
     }
 
@@ -39,7 +62,14 @@ export const Logs = new class {
                 return;
             }
             element.innerHTML = '';
-            this.logs.forEach(entry => this.render(entry));
+            const fragment = document.createDocumentFragment();
+            this.logs.forEach(entry => {
+                const row = document.createElement('div');
+                row.textContent = entry;
+                fragment.appendChild(row);
+            });
+            element.appendChild(fragment);
+            console?.scrollToBottom();
         }, 1);
     }
 

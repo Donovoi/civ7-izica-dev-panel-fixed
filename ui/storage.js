@@ -12,6 +12,11 @@ export const Storage = new (class {
     return {};
   }
 
+  // Persist the full mod settings blob back to localStorage.
+  writeAll(modSettings) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(modSettings));
+  }
+
   set(key, value) {
     // Read the existing settings without touching unrelated localStorage keys.
     const modSettings = this.readAll();
@@ -20,10 +25,17 @@ export const Storage = new (class {
     modSettings[key] = value;
 
     // Save the updated settings blob back to localStorage.
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(modSettings));
+    this.writeAll(modSettings);
 
     // Keep the existing debug logging behavior.
     console.warn(`SAVE ${key}=${JSON.stringify(value)}`);
+  }
+
+  // Save one setting without spamming the mirrored debug console.
+  setQuietly(key, value) {
+    const modSettings = this.readAll();
+    modSettings[key] = value;
+    this.writeAll(modSettings);
   }
 
   get(key) {

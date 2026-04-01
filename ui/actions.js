@@ -3,6 +3,7 @@ import { C as ComponentID } from "/core/ui/utilities/utilities-component-id.chun
 
 import { Storage } from "./storage.js";
 import { Console } from "./console.js";
+import { Logs } from "./logs.js";
 import { InfiniteMovement } from "./infinite-movement.js";
 
 export const Actions = new (class {
@@ -58,6 +59,51 @@ export const Actions = new (class {
   // Store the timer used to restore the idle status text after a completion message.
   commanderStatusResetTimer = null;
 
+  // Store the timer used to restore the idle progression status text after a completion message.
+  progressionStatusResetTimer = null;
+
+  // Track whether the player asked for the full tech-and-civic sweep.
+  progressionAutomationRequested = false;
+
+  // Prevent multiple delayed progression passes from piling up at once.
+  progressionAutomationStepScheduled = false;
+
+  // Count how many techs and civics the background sweep completed in the current run.
+  progressionAutomationTechCompleted = 0;
+  progressionAutomationCivicCompleted = 0;
+
+  // Track which tech/civic node is currently waiting for completion so we do not spam the same grant forever.
+  progressionAutomationInFlight = {
+    tech: null,
+    civic: null,
+  };
+
+  // Track whether the fast-gameplay option bundle is currently enabled through the dev panel.
+  fastGameplayEnabled = false;
+
+  // Track whether the lightweight frame profiler is currently sampling frame times.
+  performanceProfilerEnabled = false;
+
+  // Hold the current requestAnimationFrame handle for the profiler loop.
+  performanceProfilerFrameHandle = 0;
+
+  // Track timing stats for the current profiler reporting window.
+  performanceProfilerLastFrameAt = 0;
+  performanceProfilerWindowStartedAt = 0;
+  performanceProfilerFrameCount = 0;
+  performanceProfilerSlowFrameCount = 0;
+  performanceProfilerVerySlowFrameCount = 0;
+  performanceProfilerHitchFrameCount = 0;
+  performanceProfilerWorstFrameMs = 0;
+  performanceProfilerFrameSamples = [];
+  performanceProfilerLastOutlierLoggedAt = 0;
+
+  // Track the current profiler session identity so resumed saves append to the same stored log buffer.
+  performanceProfilerSessionKey = "";
+  performanceProfilerSessionName = "";
+  performanceProfilerMaxSessionCount = 6;
+  performanceProfilerMaxEntriesPerSession = 800;
+
   // Track transient retries so commander automation can wait for gamecore without stalling forever.
   commanderAdminRetryCounts = new Map();
 
@@ -66,10 +112,14 @@ export const Actions = new (class {
 
   // Short hover summaries for the dev-panel buttons.
   buttonTooltips = {
+    "toggle-dev-panel": "Hide or show the dev panel.",
     "font-increase": "Increase the dev panel size.",
     "font-decrease": "Decrease the dev panel size.",
     "left-decrease": "Move the dev panel left.",
     "left-increase": "Move the dev panel right.",
+    "toggle-fast-gameplay": "Toggle quick combat, quick movement, and notification camera panning for a snappier game flow.",
+    "toggle-performance-profiler": "Toggle a lightweight frame-time profiler that reports UI stutters, records resumable session diagnostics, and keeps the console chatty in a helpful way.",
+    "copy-all-logs": "Copy the current save's profiler session log and the mirrored dev console log to the clipboard so you can paste them into a text file for debugging.",
     "add-gold": "Grant 1,000,000 gold.",
     "add-influence": "Grant 1,000,000 influence.",
     "add-wildcard-attribute-point": "Grant 1 wildcard attribute point.",
@@ -77,7 +127,7 @@ export const Actions = new (class {
     "complete-production": "Complete production in every city.",
     "add-population": "Add 1 rural population to every city.",
     "spawn-settler": "Spawn a settler at your capital.",
-    "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or army upgrades.",
+    "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or formation upgrades, including land, naval, and air commanders.",
     "reinforce-all-units": "Send every eligible land, sea, and air unit to a valid commander.",
     "toggle-infinite-movement": "Toggle infinite movement for your units.",
     "heal-units": "Heal every alive player's unit, including packed and traveling units when possible.",
@@ -85,6 +135,7 @@ export const Actions = new (class {
     "sleep-all-units": "Put every local unit to sleep.",
     "complete-tech": "Finish the active technology.",
     "complete-civic": "Finish the active civic.",
+    "complete-all-research-civics": "Finish every remaining technology and civic, auto-pick the next node each time, and stop once Future Tech and Future Civic are selected.",
     "autoplay-1": "Start autoplay for 1 turn and run admin automation.",
     "autoplay-5": "Start autoplay for 5 turns and run admin automation.",
     "autoplay-10": "Start autoplay for 10 turns and run admin automation.",
@@ -122,8 +173,12 @@ export const Actions = new (class {
     this.completeProduction = this.completeProduction.bind(this);
     this.addPopulation = this.addPopulation.bind(this);
     this.spawnSettler = this.spawnSettler.bind(this);
+    this.toggleFastGameplay = this.toggleFastGameplay.bind(this);
+    this.togglePerformanceProfiler = this.togglePerformanceProfiler.bind(this);
+    this.copyAllLogs = this.copyAllLogs.bind(this);
     this.completeTech = this.completeTech.bind(this);
     this.completeCivic = this.completeCivic.bind(this);
+    this.completeAllResearchAndCivics = this.completeAllResearchAndCivics.bind(this);
     this.healUnits = this.healUnits.bind(this);
     this.addXp = this.addXp.bind(this);
     this.sleepAllUnits = this.sleepAllUnits.bind(this);
@@ -142,6 +197,8 @@ export const Actions = new (class {
     this.onUnitExperienceChanged = this.onUnitExperienceChanged.bind(this);
     this.onUnitPromoted = this.onUnitPromoted.bind(this);
     this.onUnitCommandStarted = this.onUnitCommandStarted.bind(this);
+    this.onTechNodeCompleted = this.onTechNodeCompleted.bind(this);
+    this.onCultureNodeCompleted = this.onCultureNodeCompleted.bind(this);
 
     // Build the action map only after binding so stored callbacks keep the singleton context.
     this.map = {
@@ -163,7 +220,7 @@ export const Actions = new (class {
         Storage.set("dev-panel-font-size", 0.65);
 
         // Save the default horizontal offset.
-        Storage.set("dev-panel-position-left", 20.75);
+        Storage.set("dev-panel-position-left", 0.75);
 
         // Reapply the saved font size to the live panel.
         this.updateFontSize();
@@ -178,6 +235,15 @@ export const Actions = new (class {
       // Nudge the panel to the left.
       "left-decrease": () => this.updatePositionLeft(-0.25),
 
+      // Toggle the fast-gameplay option bundle.
+      "toggle-fast-gameplay": this.toggleFastGameplay,
+
+      // Toggle the lightweight frame profiler.
+      "toggle-performance-profiler": this.togglePerformanceProfiler,
+
+      // Copy the persisted profiler session log plus the mirrored dev console buffer to the clipboard.
+      "copy-all-logs": this.copyAllLogs,
+
       // Queue autoplay for 1 turn.
       "autoplay-1": this.startAutoplay(1),
 
@@ -190,7 +256,7 @@ export const Actions = new (class {
       // Queue autoplay for 25 turns.
       "autoplay-25": this.startAutoplay(25),
 
-      // Spend every available promotion, commendation, and army upgrade across all commanders.
+      // Spend every available promotion, commendation, and formation upgrade across all commanders.
       "upgrade-commander": this.upgradeSelectedCommander,
 
       // Assign every currently reinforceable unit to a valid commander plot.
@@ -237,6 +303,9 @@ export const Actions = new (class {
 
       // Finish the current civic.
       "complete-civic": this.completeCivic,
+
+      // Finish every remaining tech and civic, then stop on the future repeatables.
+      "complete-all-research-civics": this.completeAllResearchAndCivics,
 
       // Reload the UI layer.
       "reload-ui": this.reloadUI,
@@ -395,6 +464,38 @@ export const Actions = new (class {
     element.textContent = message;
   }
 
+  // Find the dev-panel status line for research/civic automation.
+  getProgressionStatusElement() {
+    return document.querySelector(".dev-panel-status--progression");
+  }
+
+  // Update the progression status line shown in the panel.
+  setProgressionStatus(message) {
+    const element = this.getProgressionStatusElement();
+
+    if (!element) {
+      return;
+    }
+
+    element.textContent = message;
+  }
+
+  // Find the dev-panel status line for performance/profiling helpers.
+  getPerformanceStatusElement() {
+    return document.querySelector(".dev-panel-status--performance");
+  }
+
+  // Update the performance status line shown in the panel.
+  setPerformanceStatus(message) {
+    const element = this.getPerformanceStatusElement();
+
+    if (!element) {
+      return;
+    }
+
+    element.textContent = message;
+  }
+
   // Restore the default commander/admin status text after a short delay.
   scheduleCommanderStatusReset(delay = 2500) {
     if (this.commanderStatusResetTimer) {
@@ -404,6 +505,18 @@ export const Actions = new (class {
     this.commanderStatusResetTimer = setTimeout(() => {
       this.commanderStatusResetTimer = null;
       this.setCommanderStatus("Commanders: ready");
+    }, delay);
+  }
+
+  // Restore the default progression status text after a short delay.
+  scheduleProgressionStatusReset(delay = 2500) {
+    if (this.progressionStatusResetTimer) {
+      clearTimeout(this.progressionStatusResetTimer);
+    }
+
+    this.progressionStatusResetTimer = setTimeout(() => {
+      this.progressionStatusResetTimer = null;
+      this.setProgressionStatus("Progression: ready");
     }, delay);
   }
 
@@ -537,6 +650,8 @@ export const Actions = new (class {
     engine.on("UnitExperienceChanged", this.onUnitExperienceChanged, this);
     engine.on("UnitPromoted", this.onUnitPromoted, this);
     engine.on("UnitCommandStarted", this.onUnitCommandStarted, this);
+    engine.on("TechNodeCompleted", this.onTechNodeCompleted, this);
+    engine.on("CultureNodeCompleted", this.onCultureNodeCompleted, this);
   }
 
   // Compare two component IDs safely.
@@ -942,10 +1057,10 @@ export const Actions = new (class {
     return data?.initiatingUnit ?? data?.unit ?? null;
   }
 
-  // Count how many commanders still have an upgrade, commendation, or army upgrade available.
+  // Count how many commanders still have a promotion, commendation, or formation upgrade available.
   getCommandersWithAdminActionsCount() {
     return this.getCommanderUnits().filter((commander) =>
-      Boolean(this.getNextCommanderAdminAction(commander)),
+      Boolean(this.getNextCommanderAdminAction(commander, true)),
     ).length;
   }
 
@@ -956,28 +1071,42 @@ export const Actions = new (class {
 
   // Build the ordered list of admin actions the current commander can legally try right now.
   getCommanderAdminActions(commander, allowTemporarySelection = false) {
-    const actions = this.getCommanderPromotionCandidates(commander).map(
-      (candidate) => ({
-        kind: "promotion",
-        candidate,
-      }),
-    );
+    const buildActions = (resolvedCommander) => {
+      const actions = this.getCommanderPromotionCandidates(resolvedCommander).map(
+        (candidate) => ({
+          kind: "promotion",
+          candidate,
+        }),
+      );
 
-    const upgradeArmyResult = this.canStartUnitCommand(
-      commander.id,
-      "UNITCOMMAND_UPGRADE_ARMY",
-      this.getDefaultCommandArgs(),
-      allowTemporarySelection,
-    );
+      const upgradeArmyResult = this.canStartUnitCommand(
+        resolvedCommander.id,
+        "UNITCOMMAND_UPGRADE_ARMY",
+        this.getDefaultCommandArgs(),
+        false,
+      );
 
-    if (upgradeArmyResult?.Success) {
-      actions.push({
-        kind: "upgrade-army",
-        commandType: "UNITCOMMAND_UPGRADE_ARMY",
-      });
+      if (upgradeArmyResult?.Success) {
+        actions.push({
+          kind: "upgrade-army",
+          commandType: "UNITCOMMAND_UPGRADE_ARMY",
+        });
+      }
+
+      return actions;
+    };
+
+    const directActions = buildActions(commander);
+
+    if (directActions.length > 0 || !allowTemporarySelection) {
+      return directActions;
     }
 
-    return actions;
+    return (
+      this.withTemporaryUnitSelection(commander.id, () =>
+        buildActions(Units.get(commander.id) ?? commander),
+      ) ?? directActions
+    );
   }
 
   // Build a stable signature for one commander admin action so progress checks can tell whether options changed.
@@ -1640,8 +1769,8 @@ export const Actions = new (class {
   }
 
   // Choose the next automatic commander admin action, prioritizing promotions and commendations first.
-  getNextCommanderAdminAction(commander) {
-    return this.getCommanderAdminActions(commander)[0] ?? null;
+  getNextCommanderAdminAction(commander, allowTemporarySelection = false) {
+    return this.getCommanderAdminActions(commander, allowTemporarySelection)[0] ?? null;
   }
 
   // Send a single promotion or commendation request to the game core.
@@ -1790,7 +1919,7 @@ export const Actions = new (class {
     this.processAdminQueues();
   }
 
-  // Queue every commander that can currently spend promotions, commendations, or army upgrades.
+  // Queue every commander that can currently spend promotions, commendations, or formation upgrades.
   upgradeSelectedCommander() {
     const commanders = this.getCommanderUnits();
 
@@ -2007,28 +2136,45 @@ export const Actions = new (class {
   register() {
     // Walk every action definition so we can wire matching panel buttons.
     Object.entries(this.map).forEach(([key, callback]) => {
-      // Find the button with the class that matches the action key.
-      const button = document.querySelector(`.dev-panel-button--${key}`);
+      // Find every control with the class that matches the action key.
+      const buttons = document.querySelectorAll(`.dev-panel-button--${key}`);
 
       // Skip actions that only exist as hotkeys or are not present in the DOM.
-      if (!button) {
+      if (!buttons.length) {
         return;
       }
 
       const tooltip = this.buttonTooltips[key];
 
-      if (tooltip) {
-        button.setAttribute("data-tooltip-content", tooltip);
-        button.setAttribute("data-tooltip-anchor", "top");
-        button.setAttribute("title", tooltip);
-      }
+      buttons.forEach((button) => {
+        if (tooltip) {
+          button.setAttribute("data-tooltip-content", tooltip);
+          button.setAttribute("data-tooltip-anchor", "top");
+          button.setAttribute("title", tooltip);
+        }
 
-      // Remove any previous registration so reopening the panel does not stack handlers.
-      button.removeEventListener("action-activate", callback);
+        // Remove any previous registration so reopening the panel does not stack handlers.
+        button.removeEventListener("action-activate", callback);
 
-      // Attach the handler that will run when the button is activated.
-      button.addEventListener("action-activate", callback);
+        // Attach the handler that will run when the button is activated.
+        button.addEventListener("action-activate", callback);
+      });
     });
+
+    this.applyFastGameplaySettings(this.isFastGameplayEnabled());
+    this.updatePerformanceProfilerLabel();
+
+    if (this.performanceProfilerEnabled) {
+      this.setPerformanceStatus("Profiler: sampling frame times…");
+    } else if (!this.fastGameplayEnabled) {
+      this.setPerformanceStatus("Performance: ready");
+    }
+
+    if (this.progressionAutomationRequested) {
+      this.scheduleProgressionAutomation();
+    } else {
+      this.setProgressionStatus("Progression: ready");
+    }
 
     this.finishManualAdminStatusIfIdle();
   }
@@ -2055,9 +2201,21 @@ export const Actions = new (class {
     }
   }
 
+  // Migrate older saved panel positions so the redesigned sidebar opens on the left by default.
+  migratePanelLayout() {
+    const layoutVersion = Number(Storage.get("dev-panel-layout-version") ?? 0);
+
+    if (layoutVersion >= 2) {
+      return;
+    }
+
+    Storage.set("dev-panel-layout-version", 2);
+    Storage.set("dev-panel-position-left", 0.75);
+  }
+
   updatePositionLeft(value = 0) {
     // Start from the saved left offset, or the default offset when unset.
-    let positionLeft = Number(Storage.get("dev-panel-position-left") ?? 20.75);
+    let positionLeft = Number(Storage.get("dev-panel-position-left") ?? 0.75);
 
     // Apply the requested horizontal delta.
     positionLeft += Number(value ?? 0);
@@ -2075,6 +2233,564 @@ export const Actions = new (class {
     if (element) {
       element.style.left = `${positionLeft}rem`;
     }
+  }
+
+  // Resolve a user-facing string that may already be localized or may still be a localization key.
+  resolveDisplayText(value, fallback = "") {
+    if (typeof value !== "string" || value.length <= 0) {
+      return fallback;
+    }
+
+    try {
+      const localizedValue = Locale.compose(value);
+
+      return typeof localizedValue === "string" && localizedValue.length > 0
+        ? localizedValue
+        : value;
+    } catch (_error) {
+      return value;
+    }
+  }
+
+  // Turn arbitrary session parts into storage-safe slugs.
+  sanitizeProfilerSessionPart(value, fallback = "unknown") {
+    const normalizedValue = `${value ?? ""}`
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+
+    return normalizedValue || fallback;
+  }
+
+  // Build stable profiler session metadata from the current save so resumed games append to the same stored log buffer.
+  getProfilerSessionMetadata() {
+    const localPlayer = this.getLocalPlayer();
+    const localPlayerId = this.getLocalPlayerId();
+    const leaderType = localPlayer?.leaderType ?? localPlayer?.leaderName ?? "unknown-leader";
+    const leaderInfo = GameInfo.Leaders.lookup?.(leaderType);
+    const leaderName =
+      this.resolveDisplayText(leaderInfo?.Name) ||
+      `${localPlayer?.leaderName ?? localPlayer?.name ?? leaderType}`;
+    const civNameRaw =
+      localPlayer?.civilizationName ??
+      localPlayer?.civilizationAdjective ??
+      localPlayer?.civilizationType ??
+      "unknown-civ";
+    const civName = this.resolveDisplayText(civNameRaw) || `${civNameRaw}`;
+    const playerName = `${localPlayer?.name ?? `Player ${localPlayerId ?? "unknown"}`}`;
+    const civilizationType = `${localPlayer?.civilizationType ?? civName}`;
+    const mapSeed =
+      Configuration.getMap?.()?.mapSeed ?? GameplayMap.getRandomSeed?.() ?? "unknown-map-seed";
+    const gameSeed = Configuration.getGame?.()?.gameSeed ?? "unknown-game-seed";
+    const sessionKey = [
+      "leader",
+      this.sanitizeProfilerSessionPart(leaderType, "leader"),
+      "civ",
+      this.sanitizeProfilerSessionPart(civilizationType, "civ"),
+      "map",
+      this.sanitizeProfilerSessionPart(mapSeed, "map"),
+      "game",
+      this.sanitizeProfilerSessionPart(gameSeed, "game"),
+      "player",
+      this.sanitizeProfilerSessionPart(localPlayerId, "player"),
+    ].join("-");
+    const sessionName = `${leaderName} · ${civName} · map ${mapSeed}`;
+
+    this.performanceProfilerSessionKey = sessionKey;
+    this.performanceProfilerSessionName = sessionName;
+
+    return {
+      sessionKey,
+      sessionName,
+      playerName,
+      localPlayerId,
+      leaderName,
+      leaderType,
+      civName,
+      civilizationType,
+      mapSeed,
+      gameSeed,
+    };
+  }
+
+  // Read the persistent profiler session store from localStorage.
+  getProfilerSessionStore() {
+    const store = Storage.get("dev-panel-profiler-sessions");
+
+    return store && typeof store === "object" && !Array.isArray(store)
+      ? store
+      : {};
+  }
+
+  // Keep only a handful of recent profiler sessions so the localStorage blob stays lightweight.
+  trimProfilerSessionStore(store) {
+    const sortedSessionKeys = Object.keys(store).sort((leftKey, rightKey) => {
+      const leftUpdatedAt =
+        Date.parse(store[leftKey]?.updatedAt ?? store[leftKey]?.createdAt ?? "") || 0;
+      const rightUpdatedAt =
+        Date.parse(store[rightKey]?.updatedAt ?? store[rightKey]?.createdAt ?? "") || 0;
+
+      return rightUpdatedAt - leftUpdatedAt;
+    });
+
+    sortedSessionKeys
+      .slice(this.performanceProfilerMaxSessionCount)
+      .forEach((sessionKey) => {
+        delete store[sessionKey];
+      });
+  }
+
+  // Persist the profiler session store quietly so it does not flood the mirrored dev console.
+  saveProfilerSessionStore(store) {
+    this.trimProfilerSessionStore(store);
+    Storage.setQuietly("dev-panel-profiler-sessions", store);
+  }
+
+  // Append one profiler entry to the current session log.
+  appendProfilerSessionEntry(level, message) {
+    const metadata = this.getProfilerSessionMetadata();
+    const timestamp = new Date().toISOString();
+    const store = this.getProfilerSessionStore();
+    const session = store[metadata.sessionKey] ?? {
+      createdAt: timestamp,
+      metadata,
+      entries: [],
+    };
+
+    session.metadata = {
+      ...(session.metadata ?? {}),
+      ...metadata,
+    };
+    session.updatedAt = timestamp;
+    session.entries = Array.isArray(session.entries) ? session.entries : [];
+    session.entries.push({
+      timestamp,
+      level,
+      message,
+    });
+
+    while (session.entries.length > this.performanceProfilerMaxEntriesPerSession) {
+      session.entries.shift();
+    }
+
+    store[metadata.sessionKey] = session;
+    this.saveProfilerSessionStore(store);
+    return session;
+  }
+
+  // Return the persisted profiler session that matches the current save context.
+  getActiveProfilerSession() {
+    const metadata = this.getProfilerSessionMetadata();
+    const store = this.getProfilerSessionStore();
+
+    return store[metadata.sessionKey] ?? null;
+  }
+
+  // Format one persisted profiler session as plain text so it can be copied or dumped into the console.
+  formatProfilerSessionLog(session) {
+    if (!session) {
+      return "";
+    }
+
+    const metadata = session.metadata ?? {};
+    const entries = Array.isArray(session.entries) ? session.entries : [];
+
+    return [
+      "Dev Panel Profiler Log",
+      `Session: ${metadata.sessionName ?? metadata.sessionKey ?? "unknown session"}`,
+      `Session Key: ${metadata.sessionKey ?? "unknown"}`,
+      `Player: ${metadata.playerName ?? "unknown"}`,
+      `Leader: ${metadata.leaderName ?? metadata.leaderType ?? "unknown"}`,
+      `Civilization: ${metadata.civName ?? metadata.civilizationType ?? "unknown"}`,
+      `Map Seed: ${metadata.mapSeed ?? "unknown"}`,
+      `Game Seed: ${metadata.gameSeed ?? "unknown"}`,
+      `Created: ${session.createdAt ?? "unknown"}`,
+      `Updated: ${session.updatedAt ?? "unknown"}`,
+      `Entries: ${entries.length}`,
+      "",
+      ...entries.map(
+        (entry) =>
+          `[${entry.timestamp ?? "unknown time"}] [${String(entry.level ?? "info").toUpperCase()}] ${entry.message ?? ""}`,
+      ),
+    ].join("\n");
+  }
+
+  // Format the combined debug export so it can be pasted directly into a text file.
+  formatCombinedLogExport(session, consoleEntries) {
+    const profilerLog =
+      session && Array.isArray(session.entries) && session.entries.length > 0
+        ? this.formatProfilerSessionLog(session)
+        : "No profiler session entries recorded yet.";
+    const mirroredConsoleLog = consoleEntries.length > 0
+      ? Logs.getText()
+      : "No mirrored dev console entries recorded yet.";
+
+    return [
+      "Dev Panel Debug Export",
+      `Generated: ${new Date().toISOString()}`,
+      `Panel Console Visible: ${Console.isVisible() ? "yes" : "no"}`,
+      `Mirrored Console Entries: ${consoleEntries.length}`,
+      "",
+      "=== Profiler Session Log ===",
+      profilerLog,
+      "",
+      "=== Mirrored Dev Console Log ===",
+      mirroredConsoleLog,
+    ].join("\n");
+  }
+
+  // Copy the profiler session log plus the mirrored dev console buffer to the clipboard.
+  copyAllLogs() {
+    const session = this.getActiveProfilerSession();
+    const consoleEntries = Logs.getEntries();
+    const hasProfilerEntries =
+      session && Array.isArray(session.entries) && session.entries.length > 0;
+    const hasConsoleEntries = consoleEntries.length > 0;
+
+    if (!hasProfilerEntries && !hasConsoleEntries) {
+      this.setPerformanceStatus("Copy logs: nothing recorded yet.");
+      console.log("Dev panel: no profiler or mirrored console logs recorded yet.");
+      return;
+    }
+
+    const formattedLog = this.formatCombinedLogExport(session, consoleEntries);
+
+    if (UI.isClipboardAvailable?.() && typeof UI.setClipboardText === "function") {
+      UI.setClipboardText(formattedLog);
+      this.setPerformanceStatus(
+        `Logs copied · ${hasProfilerEntries ? session.entries.length : 0} profiler entries · ${consoleEntries.length} console lines`,
+      );
+      console.log(
+        `Dev panel: copied combined debug log${session?.metadata?.sessionName ? ` for ${session.metadata.sessionName}` : ""}.`,
+      );
+      return;
+    }
+
+    this.setPerformanceStatus("Clipboard unavailable; dumped combined debug log into the browser console.");
+    console.log(`Dev panel: combined debug log dump follows.\n${formattedLog}`);
+  }
+
+  // Describe the current UI/gameplay context around a profiler sample so hitch logs are easier to interpret later.
+  describeProfilerContext() {
+    const selectedUnit = this.getSelectedUnit();
+    const selectedUnitLabel = selectedUnit
+      ? this.getUnitDisplayName(selectedUnit)
+      : "none";
+    const pendingReinforcements =
+      this.reinforcementQueue.length + (this.reinforcementInFlight ? 1 : 0);
+
+    return [
+      `selected=${selectedUnitLabel}`,
+      `console=${Console.isVisible() ? "open" : "closed"}`,
+      `fastGameplay=${this.fastGameplayEnabled ? "on" : "off"}`,
+      `commandersPending=${this.getPendingCommanderQueueCount()}`,
+      `reinforcementsPending=${pendingReinforcements}`,
+    ].join(" · ");
+  }
+
+  // Read one percentile from a sorted frame-time sample list.
+  getProfilerPercentile(sortedSamples, percentile) {
+    if (!Array.isArray(sortedSamples) || sortedSamples.length <= 0) {
+      return 0;
+    }
+
+    const boundedPercentile = Math.min(Math.max(percentile, 0), 100);
+    const sampleIndex = Math.min(
+      sortedSamples.length - 1,
+      Math.max(0, Math.ceil((boundedPercentile / 100) * sortedSamples.length) - 1),
+    );
+
+    return Number(sortedSamples[sampleIndex] ?? 0);
+  }
+
+  // Emit one detailed profiler outlier log, with light rate limiting so minor stutters do not spam forever.
+  logPerformanceProfilerOutlier(frameMs, timestamp) {
+    const isHitch = frameMs >= 100;
+
+    if (!isHitch && timestamp - this.performanceProfilerLastOutlierLoggedAt < 2000) {
+      return;
+    }
+
+    this.performanceProfilerLastOutlierLoggedAt = timestamp;
+    const message = `${isHitch ? "Hitch" : "Long frame"} detected: ${frameMs.toFixed(1)} ms · ${this.describeProfilerContext()}`;
+
+    this.appendProfilerSessionEntry(isHitch ? "warn" : "info", message);
+    console.log(`Dev panel: ${message}`);
+  }
+
+  // Flush the current profiler window into the status text, console, and persistent session log.
+  flushPerformanceProfilerWindow(timestamp, reason = "interval") {
+    if (this.performanceProfilerFrameCount <= 0) {
+      this.resetPerformanceProfilerWindow(timestamp);
+      return null;
+    }
+
+    const sampledDuration = Math.max(
+      timestamp - this.performanceProfilerWindowStartedAt,
+      1,
+    );
+    const averageFrameMs = sampledDuration / Math.max(this.performanceProfilerFrameCount, 1);
+    const fps = 1000 / averageFrameMs;
+    const sortedSamples = [...this.performanceProfilerFrameSamples].sort(
+      (left, right) => left - right,
+    );
+    const medianFrameMs = this.getProfilerPercentile(sortedSamples, 50);
+    const p95FrameMs = this.getProfilerPercentile(sortedSamples, 95);
+    const compactSummary = `Profiler: ${averageFrameMs.toFixed(1)} ms avg · ${fps.toFixed(0)} FPS · p95 ${p95FrameMs.toFixed(1)} ms · ${this.performanceProfilerSlowFrameCount} slow · ${this.performanceProfilerHitchFrameCount} hitches · ${this.performanceProfilerWorstFrameMs.toFixed(1)} ms worst`;
+    const detailedSummary = [
+      reason === "stop" ? "Profiler stop snapshot" : "Profiler window",
+      `session=${this.performanceProfilerSessionName || this.getProfilerSessionMetadata().sessionName}`,
+      `duration=${sampledDuration.toFixed(0)} ms`,
+      `frames=${this.performanceProfilerFrameCount}`,
+      `avg=${averageFrameMs.toFixed(2)} ms`,
+      `fps=${fps.toFixed(1)}`,
+      `p50=${medianFrameMs.toFixed(1)} ms`,
+      `p95=${p95FrameMs.toFixed(1)} ms`,
+      `slow34=${this.performanceProfilerSlowFrameCount}`,
+      `slow50=${this.performanceProfilerVerySlowFrameCount}`,
+      `hitches100=${this.performanceProfilerHitchFrameCount}`,
+      `worst=${this.performanceProfilerWorstFrameMs.toFixed(1)} ms`,
+      this.describeProfilerContext(),
+    ].join(" · ");
+
+    this.setPerformanceStatus(compactSummary);
+    this.appendProfilerSessionEntry("info", detailedSummary);
+    console.log(`Dev panel: ${detailedSummary}`);
+    this.resetPerformanceProfilerWindow(timestamp);
+    return compactSummary;
+  }
+
+  // Read the persisted fast-gameplay state once and normalize it to a boolean.
+  isFastGameplayEnabled() {
+    return Boolean(Storage.get("dev-panel-fast-gameplay"));
+  }
+
+  // Update the fast-gameplay button label so it reflects the current option bundle state.
+  updateFastGameplayLabel() {
+    const label = document.querySelector(
+      ".dev-panel-button__label--toggle-fast-gameplay",
+    );
+
+    if (label) {
+      label.textContent = this.fastGameplayEnabled
+        ? "Fast gameplay: On"
+        : "Fast gameplay: Off";
+    }
+  }
+
+  // Update the profiler button label so it reflects whether frame sampling is active right now.
+  updatePerformanceProfilerLabel() {
+    const label = document.querySelector(
+      ".dev-panel-button__label--toggle-performance-profiler",
+    );
+
+    if (label) {
+      label.textContent = this.performanceProfilerEnabled
+        ? "Profiler: On"
+        : "Profiler: Off";
+    }
+  }
+
+  // Apply or release the hidden fast-gameplay settings that skip combat/movement presentation overhead.
+  applyFastGameplaySettings(enabled) {
+    this.fastGameplayEnabled = Boolean(enabled);
+
+    if (this.fastGameplayEnabled) {
+      const previousNotificationPan = UI.getOption?.(
+        "user",
+        "Interface",
+        "NotificationCameraPan",
+      );
+
+      if (
+        Storage.get("dev-panel-notification-camera-pan-before-fast") === null &&
+        previousNotificationPan !== undefined &&
+        previousNotificationPan !== null
+      ) {
+        Storage.set(
+          "dev-panel-notification-camera-pan-before-fast",
+          Number(previousNotificationPan),
+        );
+      }
+
+      Configuration.getUser()?.setLockedValue?.("QuickMovement", true);
+      Configuration.getUser()?.setLockedValue?.("QuickCombat", true);
+      UI.setOption?.("user", "Interface", "NotificationCameraPan", 0);
+      this.setPerformanceStatus(
+        "Fast gameplay enabled: quick combat, quick movement, and notification camera pans reduced.",
+      );
+    } else {
+      Configuration.getUser()?.lockValue?.("QuickMovement", false);
+      Configuration.getUser()?.lockValue?.("QuickCombat", false);
+
+      const previousNotificationPan = Storage.get(
+        "dev-panel-notification-camera-pan-before-fast",
+      );
+
+      if (previousNotificationPan !== null) {
+        UI.setOption?.(
+          "user",
+          "Interface",
+          "NotificationCameraPan",
+          Number(previousNotificationPan) ? 1 : 0,
+        );
+        Storage.set("dev-panel-notification-camera-pan-before-fast", null);
+      }
+
+      this.setPerformanceStatus("Performance: ready");
+    }
+
+    this.updateFastGameplayLabel();
+  }
+
+  // Toggle the hidden fast-gameplay option bundle on or off.
+  toggleFastGameplay() {
+    const nextEnabled = !this.fastGameplayEnabled;
+
+    Storage.set("dev-panel-fast-gameplay", nextEnabled);
+    this.applyFastGameplaySettings(nextEnabled);
+    console.log(
+      `Dev panel: fast gameplay ${nextEnabled ? "enabled" : "disabled"}.`,
+    );
+  }
+
+  // Reset one profiler reporting window so the next sample batch starts cleanly.
+  resetPerformanceProfilerWindow(startedAt = 0) {
+    this.performanceProfilerWindowStartedAt = startedAt;
+    this.performanceProfilerFrameCount = 0;
+    this.performanceProfilerSlowFrameCount = 0;
+    this.performanceProfilerVerySlowFrameCount = 0;
+    this.performanceProfilerHitchFrameCount = 0;
+    this.performanceProfilerWorstFrameMs = 0;
+    this.performanceProfilerFrameSamples = [];
+  }
+
+  // Handle one requestAnimationFrame profiler tick and emit verbose frame-time diagnostics every couple of seconds.
+  onPerformanceProfilerFrame(timestamp) {
+    if (!this.performanceProfilerEnabled) {
+      return;
+    }
+
+    if (this.performanceProfilerLastFrameAt > 0) {
+      const frameMs = timestamp - this.performanceProfilerLastFrameAt;
+
+      this.performanceProfilerFrameCount += 1;
+      this.performanceProfilerFrameSamples.push(frameMs);
+      this.performanceProfilerWorstFrameMs = Math.max(
+        this.performanceProfilerWorstFrameMs,
+        frameMs,
+      );
+
+      if (frameMs > 34) {
+        this.performanceProfilerSlowFrameCount += 1;
+      }
+
+      if (frameMs > 50) {
+        this.performanceProfilerVerySlowFrameCount += 1;
+        this.logPerformanceProfilerOutlier(frameMs, timestamp);
+      }
+
+      if (frameMs >= 100) {
+        this.performanceProfilerHitchFrameCount += 1;
+      }
+    }
+
+    if (this.performanceProfilerWindowStartedAt <= 0) {
+      this.performanceProfilerWindowStartedAt = timestamp;
+    }
+
+    this.performanceProfilerLastFrameAt = timestamp;
+
+    if (timestamp - this.performanceProfilerWindowStartedAt >= 2000) {
+      this.flushPerformanceProfilerWindow(timestamp);
+    }
+
+    this.performanceProfilerFrameHandle = requestAnimationFrame((nextTimestamp) => {
+      this.onPerformanceProfilerFrame(nextTimestamp);
+    });
+  }
+
+  // Start the lightweight frame profiler.
+  startPerformanceProfiler() {
+    if (this.performanceProfilerEnabled) {
+      return;
+    }
+
+    const metadata = this.getProfilerSessionMetadata();
+
+    this.performanceProfilerEnabled = true;
+    this.performanceProfilerFrameHandle = 0;
+    this.performanceProfilerLastFrameAt = 0;
+    this.performanceProfilerLastOutlierLoggedAt = 0;
+    this.resetPerformanceProfilerWindow();
+    this.updatePerformanceProfilerLabel();
+    this.setPerformanceStatus(`Profiler: sampling… ${metadata.sessionName}`);
+    this.appendProfilerSessionEntry(
+      "info",
+      [
+        "Profiler started",
+        `session=${metadata.sessionName}`,
+        `key=${metadata.sessionKey}`,
+        `player=${metadata.playerName}`,
+        `leader=${metadata.leaderName}`,
+        `civ=${metadata.civName}`,
+        `mapSeed=${metadata.mapSeed}`,
+        `gameSeed=${metadata.gameSeed}`,
+        `fastGameplay=${this.fastGameplayEnabled ? "on" : "off"}`,
+        this.describeProfilerContext(),
+      ].join(" · "),
+    );
+    console.log(
+      `Dev panel: profiler started · session=${metadata.sessionName} · key=${metadata.sessionKey}.`,
+    );
+    this.performanceProfilerFrameHandle = requestAnimationFrame((timestamp) => {
+      this.onPerformanceProfilerFrame(timestamp);
+    });
+  }
+
+  // Stop the lightweight frame profiler and clear its sampling loop.
+  stopPerformanceProfiler() {
+    if (this.performanceProfilerFrameHandle) {
+      cancelAnimationFrame(this.performanceProfilerFrameHandle);
+      this.performanceProfilerFrameHandle = 0;
+    }
+
+    const stopTimestamp =
+      this.performanceProfilerLastFrameAt ||
+      globalThis.performance?.now?.() ||
+      Date.now();
+
+    this.flushPerformanceProfilerWindow(stopTimestamp, "stop");
+
+    const metadata = this.getProfilerSessionMetadata();
+
+    this.appendProfilerSessionEntry(
+      "info",
+      `Profiler stopped · session=${metadata.sessionName} · ${this.describeProfilerContext()}`,
+    );
+    console.log(`Dev panel: profiler stopped · session=${metadata.sessionName}.`);
+
+    this.performanceProfilerEnabled = false;
+    this.performanceProfilerLastFrameAt = 0;
+    this.performanceProfilerLastOutlierLoggedAt = 0;
+    this.resetPerformanceProfilerWindow();
+    this.updatePerformanceProfilerLabel();
+    this.setPerformanceStatus(
+      this.fastGameplayEnabled
+        ? "Fast gameplay enabled: quick combat, quick movement, and notification camera pans reduced."
+        : "Performance: ready",
+    );
+  }
+
+  // Toggle the lightweight frame profiler on or off.
+  togglePerformanceProfiler() {
+    if (this.performanceProfilerEnabled) {
+      this.stopPerformanceProfiler();
+      return;
+    }
+
+    this.startPerformanceProfiler();
   }
 
   startAutoplay(turns) {
@@ -2389,6 +3105,413 @@ export const Actions = new (class {
         break;
       }
     }
+  }
+
+  // Close the stock tech/civic completion popup when automation needs to keep rolling.
+  dismissTechCivicPopup() {
+    if (!ContextManager.hasInstanceOf("screen-tech-civic-complete")) {
+      return false;
+    }
+
+    try {
+      ContextManager.pop("screen-tech-civic-complete");
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  // Normalize a progression node identifier into the request payload shape expected by player operations.
+  getProgressionNodeArg(nodeType) {
+    const numericNodeType = Number(nodeType);
+
+    return Number.isFinite(numericNodeType) ? numericNodeType : nodeType;
+  }
+
+  // Compare two progression node identifiers safely even when the engine mixes strings and numeric hashes.
+  isSameProgressionNode(left, right) {
+    return left !== null && left !== undefined && right !== null && right !== undefined
+      ? String(left) === String(right)
+      : false;
+  }
+
+  // Resolve a readable progression node name for status text and logs.
+  getProgressionNodeName(nodeType) {
+    const nodeInfo = GameInfo.ProgressionTreeNodes.lookup(nodeType);
+
+    if (nodeInfo?.Name) {
+      return Locale.compose(nodeInfo.Name);
+    }
+
+    return nodeInfo?.ProgressionTreeNodeType ?? String(nodeType ?? "Node");
+  }
+
+  // Check whether one progression node is the repeatable future node that should end the sweep.
+  isRepeatableProgressionNode(nodeType) {
+    const nodeInfo = GameInfo.ProgressionTreeNodes.lookup(nodeType);
+
+    return Boolean(
+      nodeInfo?.Repeatable ||
+      /FUTURE_(TECH|CIVIC)/i.test(nodeInfo?.ProgressionTreeNodeType ?? ""),
+    );
+  }
+
+  // Reset the visible progress state for the full tech-and-civic sweep.
+  resetProgressionAutomationProgress() {
+    this.progressionAutomationTechCompleted = 0;
+    this.progressionAutomationCivicCompleted = 0;
+    this.progressionAutomationInFlight = {
+      tech: null,
+      civic: null,
+    };
+  }
+
+  // Read one progression branch in a consistent shape so the automation can treat techs and civics the same way.
+  getProgressionBranchState(kind, player = this.getLocalPlayer()) {
+    if (!player) {
+      return null;
+    }
+
+    const manager = kind === "tech" ? player.Techs : player.Culture;
+
+    if (!manager) {
+      return null;
+    }
+
+    const treeType =
+      kind === "tech" ? manager.getTreeType?.() : manager.getActiveTree?.();
+
+    if (treeType === null || treeType === undefined) {
+      return null;
+    }
+
+    const treeObject = Game.ProgressionTrees.getTree(player.id, treeType);
+
+    if (!treeObject) {
+      return null;
+    }
+
+    return {
+      kind,
+      player,
+      manager,
+      treeType,
+      treeObject,
+      activeNodeType:
+        treeObject.activeNodeIndex >= 0
+          ? treeObject.nodes?.[treeObject.activeNodeIndex]?.nodeType ?? null
+          : null,
+      setNodeOperationType:
+        kind === "tech"
+          ? PlayerOperationTypes.SET_TECH_TREE_NODE
+          : PlayerOperationTypes.SET_CULTURE_TREE_NODE,
+      yieldType:
+        kind === "tech" ? YieldTypes.YIELD_SCIENCE : YieldTypes.YIELD_CULTURE,
+      futureLabel: kind === "tech" ? "Future Tech selected" : "Future Civic selected",
+    };
+  }
+
+  // Find the next selectable node in one progression branch, preferring unfinished normal nodes before the future repeatable.
+  getNextSelectableProgressionNode(branch) {
+    if (!branch?.treeObject?.nodes?.length) {
+      return null;
+    }
+
+    let repeatableNodeType = null;
+
+    for (const node of branch.treeObject.nodes) {
+      const nodeType = node?.nodeType;
+
+      if (!nodeType) {
+        continue;
+      }
+
+      const args = {
+        ProgressionTreeNodeType: this.getProgressionNodeArg(nodeType),
+      };
+      const result = Game.PlayerOperations.canStart(
+        branch.player.id,
+        branch.setNodeOperationType,
+        args,
+        false,
+      );
+
+      if (!result?.Success) {
+        continue;
+      }
+
+      if (this.isRepeatableProgressionNode(nodeType)) {
+        repeatableNodeType ??= nodeType;
+        continue;
+      }
+
+      return nodeType;
+    }
+
+    return repeatableNodeType;
+  }
+
+  // Select the next tech/civic node exactly the way the stock tree does when a node is open right now.
+  selectProgressionNode(branch, nodeType) {
+    if (!branch || !nodeType) {
+      return false;
+    }
+
+    const args = {
+      ProgressionTreeNodeType: this.getProgressionNodeArg(nodeType),
+    };
+    const result = Game.PlayerOperations.canStart(
+      branch.player.id,
+      branch.setNodeOperationType,
+      args,
+      false,
+    );
+
+    if (!result?.Success) {
+      return false;
+    }
+
+    Game.PlayerOperations.sendRequest(
+      branch.player.id,
+      branch.setNodeOperationType,
+      args,
+    );
+    return true;
+  }
+
+  // Grant enough science or culture to finish one specific active node immediately.
+  grantYieldForProgressionNode(branch, nodeType, allowRepeatable = false) {
+    if (!branch || !nodeType) {
+      return false;
+    }
+
+    const nodeInfo = GameInfo.ProgressionTreeNodes.lookup(nodeType);
+
+    if (!nodeInfo || (!allowRepeatable && this.isRepeatableProgressionNode(nodeType))) {
+      return false;
+    }
+
+    const nodeCost = Math.max(Number(branch.manager.getNodeCost(nodeType) ?? 0), 1);
+    const netYield = Number(
+      branch.player.Stats?.getNetYield(branch.yieldType) ?? 0,
+    );
+    const turnsLeft = Math.max(Number(branch.manager.getTurnsLeft?.() ?? 0), 1);
+    const grantedYield =
+      netYield > 0
+        ? Math.max(Math.ceil(netYield * turnsLeft * 1.4), nodeCost)
+        : nodeCost;
+
+    Players.grantYield(branch.player.id, branch.yieldType, grantedYield);
+    return true;
+  }
+
+  // Keep the progression status line in sync while the full tech-and-civic sweep is running.
+  updateProgressionAutomationStatus(techResult, civicResult) {
+    if (!this.progressionAutomationRequested) {
+      this.setProgressionStatus("Progression: ready");
+      return;
+    }
+
+    this.setProgressionStatus(
+      `Finishing techs & civics… ${this.progressionAutomationTechCompleted} techs, ${this.progressionAutomationCivicCompleted} civics — Tech: ${techResult.done ? techResult.futureLabel : techResult.label}; Civic: ${civicResult.done ? civicResult.futureLabel : civicResult.label}`,
+    );
+  }
+
+  // Schedule one delayed progression-automation step so the UI stays responsive while the sweep runs.
+  scheduleProgressionAutomation(delay = 0) {
+    if (!this.progressionAutomationRequested || this.progressionAutomationStepScheduled) {
+      return;
+    }
+
+    this.progressionAutomationStepScheduled = true;
+
+    const runStep = () => {
+      this.progressionAutomationStepScheduled = false;
+      this.processProgressionAutomation();
+    };
+
+    if (delay > 0) {
+      setTimeout(runStep, delay);
+      return;
+    }
+
+    requestAnimationFrame(runStep);
+  }
+
+  // Advance one tech/civic branch by either selecting its next node or finishing the current non-repeatable node.
+  processProgressionAutomationBranch(branch) {
+    if (!branch) {
+      return {
+        done: true,
+        label: "Unavailable",
+        futureLabel: "Unavailable",
+      };
+    }
+
+    const activeNodeType = branch.activeNodeType;
+    const inFlight = this.progressionAutomationInFlight[branch.kind];
+
+    if (activeNodeType && this.isRepeatableProgressionNode(activeNodeType)) {
+      this.progressionAutomationInFlight[branch.kind] = null;
+      return {
+        done: true,
+        label: this.getProgressionNodeName(activeNodeType),
+        futureLabel: branch.futureLabel,
+      };
+    }
+
+    if (!activeNodeType) {
+      this.progressionAutomationInFlight[branch.kind] = null;
+      const nextNodeType = this.getNextSelectableProgressionNode(branch);
+
+      if (!nextNodeType) {
+        return {
+          done: true,
+          label: branch.futureLabel,
+          futureLabel: branch.futureLabel,
+        };
+      }
+
+      const nextNodeName = this.getProgressionNodeName(nextNodeType);
+      const didSelect = this.selectProgressionNode(branch, nextNodeType);
+
+      return {
+        done: false,
+        label: didSelect ? `Selecting ${nextNodeName}` : `Waiting to select ${nextNodeName}`,
+        futureLabel: branch.futureLabel,
+      };
+    }
+
+    const activeNodeName = this.getProgressionNodeName(activeNodeType);
+
+    if (!inFlight || !this.isSameProgressionNode(inFlight.nodeType, activeNodeType)) {
+      const didGrant = this.grantYieldForProgressionNode(branch, activeNodeType);
+
+      if (didGrant) {
+        this.progressionAutomationInFlight[branch.kind] = {
+          nodeType: activeNodeType,
+          grantedAt: Date.now(),
+          retries: 0,
+        };
+      }
+
+      return {
+        done: false,
+        label: activeNodeName,
+        futureLabel: branch.futureLabel,
+      };
+    }
+
+    const elapsed = Date.now() - inFlight.grantedAt;
+
+    if (elapsed >= 1200 && inFlight.retries < 2) {
+      const didGrant = this.grantYieldForProgressionNode(branch, activeNodeType);
+
+      if (didGrant) {
+        inFlight.grantedAt = Date.now();
+        inFlight.retries += 1;
+      }
+    }
+
+    return {
+      done: false,
+      label: activeNodeName,
+      futureLabel: branch.futureLabel,
+    };
+  }
+
+  // Finalize the full tech-and-civic sweep and restore the idle status text after a short delay.
+  finishProgressionAutomation(message) {
+    this.progressionAutomationRequested = false;
+    this.progressionAutomationStepScheduled = false;
+    this.dismissTechCivicPopup();
+    this.resetProgressionAutomationProgress();
+    this.setProgressionStatus(message);
+    console.log(`Dev panel: ${message}`);
+    this.scheduleProgressionStatusReset(4000);
+  }
+
+  // Run the full research/civic sweep in the background until the player lands on Future Tech and Future Civic.
+  completeAllResearchAndCivics() {
+    if (!this.getLocalPlayer()) {
+      return;
+    }
+
+    if (this.progressionAutomationRequested) {
+      this.setProgressionStatus("Progression sweep already running.");
+      return;
+    }
+
+    this.progressionAutomationRequested = true;
+    this.resetProgressionAutomationProgress();
+    this.dismissTechCivicPopup();
+    this.setProgressionStatus("Finishing techs & civics…");
+    console.log(
+      "Dev panel: finishing every remaining tech and civic until Future Tech and Future Civic are selected.",
+    );
+    this.scheduleProgressionAutomation();
+  }
+
+  // Advance the full tech-and-civic sweep without monopolizing the UI thread.
+  processProgressionAutomation() {
+    if (!this.progressionAutomationRequested) {
+      return;
+    }
+
+    const player = this.getLocalPlayer();
+
+    if (!player) {
+      this.finishProgressionAutomation("Progression sweep stopped: no local player.");
+      return;
+    }
+
+    this.dismissTechCivicPopup();
+
+    const techResult = this.processProgressionAutomationBranch(
+      this.getProgressionBranchState("tech", player),
+    );
+    const civicResult = this.processProgressionAutomationBranch(
+      this.getProgressionBranchState("civic", player),
+    );
+
+    this.updateProgressionAutomationStatus(techResult, civicResult);
+
+    if (techResult.done && civicResult.done) {
+      this.finishProgressionAutomation(
+        "All standard techs and civics are finished. Future Tech and Future Civic are selected.",
+      );
+      return;
+    }
+
+    this.scheduleProgressionAutomation(150);
+  }
+
+  // Keep the full tech sweep moving whenever the current research node completes.
+  onTechNodeCompleted(data) {
+    const localPlayerId = this.getLocalPlayerId();
+
+    if (!this.progressionAutomationRequested || localPlayerId === null || data.player !== localPlayerId) {
+      return;
+    }
+
+    this.progressionAutomationTechCompleted += 1;
+    this.progressionAutomationInFlight.tech = null;
+    this.dismissTechCivicPopup();
+    this.scheduleProgressionAutomation(60);
+  }
+
+  // Keep the full civic sweep moving whenever the current civic node completes.
+  onCultureNodeCompleted(data) {
+    const localPlayerId = this.getLocalPlayerId();
+
+    if (!this.progressionAutomationRequested || localPlayerId === null || data.player !== localPlayerId) {
+      return;
+    }
+
+    this.progressionAutomationCivicCompleted += 1;
+    this.progressionAutomationInFlight.civic = null;
+    this.dismissTechCivicPopup();
+    this.scheduleProgressionAutomation(60);
   }
 
   completeTech() {

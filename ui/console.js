@@ -4,24 +4,42 @@ import { Storage } from './storage.js';
 import { Logs } from "./logs.js";
 
 export const Console = new class {
+    isVisible() {
+        return document.querySelector('.dev-panel-console')?.classList.contains('dev-panel-console--visible') ?? false;
+    }
+
+    shouldMirrorToPanel(message, kind = 'log') {
+        if (kind === 'error') {
+            return true;
+        }
+
+        return /^Dev panel:/i.test(message);
+    }
+
     constructor() {
         console.errorBase = console.errorBase || console.error;
         console.error = (...args) => {
             const data = args.map(arg => `${arg}`).join(', ');
-            Logs.add(`Error: ${data}`);
+            if (this.shouldMirrorToPanel(data, 'error')) {
+                Logs.add(`Error: ${data}`);
+            }
             return console.errorBase.apply(console, args);
         }
 
         console.logBase = console.logBase || console.log;
         console.log = (...args) => {
             const data = args.map(arg => `${arg}`).join(', ');
-            Logs.add(`Log: ${data}`);
+            if (this.shouldMirrorToPanel(data, 'log')) {
+                Logs.add(`Log: ${data}`);
+            }
             return console.logBase.apply(console, args);
         }
 
         console.pre = (...args) => {
             const data = args.map(arg => JSON.stringify(arg, null, 2)).join("\n");
-            Logs.add(`Pretty: ${data}`);
+            if (this.shouldMirrorToPanel(data, 'pretty')) {
+                Logs.add(`Pretty: ${data}`);
+            }
             return console.logBase.apply(console, args);
         }
 
@@ -29,7 +47,7 @@ export const Console = new class {
             setTimeout(() => {
                 try {
                     MustGetElement('.dev-panel-console .fxs-scrollable', document)?._component?.scrollToPercentage(1);
-                } catch (e) {}
+                } catch (e) { }
             }, 50);
         }
     }
