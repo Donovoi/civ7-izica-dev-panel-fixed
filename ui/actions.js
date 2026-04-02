@@ -196,7 +196,7 @@ export const Actions = new (class {
     "toggle-infinite-movement": "Toggle infinite movement for your units.",
     "upgrade-all-units": "Upgrade every currently eligible local unit and commander in one sweep. Regular units use the stock Upgrade Unit command, while commanders spend promotions, commendations, and army upgrades through the existing commander-admin queue.",
     "heal-units": "Heal every alive player's unit, including packed and traveling units when possible.",
-    "add-xp": "Grant a safe 200,000 XP burst to every local unit. Regular units get 200,000 XP directly, while commanders still stop at their remaining promotion and commendation cap to avoid overflowing native counters.",
+    "add-xp": "Grant 200,000 XP to every local unit and commander using the game's direct XP paths.",
     "clear-all-logs": "Clear the mirrored dev console buffer and every stored profiler session log so the next repro starts from a clean slate.",
     "sleep-all-units": "Put every local unit to sleep.",
     "complete-tech": "Finish the active technology.",
@@ -2687,6 +2687,61 @@ export const Actions = new (class {
     };
   }
 
+  // Grant the configured commander XP burst directly instead of topping up to the old safe cap.
+  grantCommanderXp(unitOrId, amount = this.militaryXpGrantAmount) {
+    const commander = ComponentID.isValid(unitOrId)
+      ? Units.get(unitOrId)
+      : unitOrId;
+
+    if (!commander?.isCommanderUnit) {
+      return {
+        didChange: false,
+        reason: "not-commander",
+      };
+    }
+
+    const initialState = this.captureCommanderXpGrantState(commander);
+    const xpAmount = Math.max(Math.ceil(Number(amount) || 0), 0);
+
+    if (xpAmount <= 0) {
+      return {
+        didChange: false,
+        reason: "invalid-amount",
+        initialState,
+        finalState: initialState,
+        appliedBy: "none",
+      };
+    }
+
+    const result = this.applyCommanderExperienceGrant(
+      commander,
+      xpAmount,
+      initialState,
+    );
+    const finalState = this.captureCommanderXpGrantState(
+      Units.get(commander.id) ?? commander,
+    );
+    const didChange = this.hasCommanderXpGrantStateChanged(
+      initialState,
+      finalState,
+    );
+
+    return {
+      didChange,
+      reason: didChange ? "xp-granted" : "no-xp-effect",
+      initialState,
+      finalState,
+      appliedBy: didChange ? result.appliedBy ?? "unknown" : "none",
+      diagnostics:
+        didChange
+          ? null
+          : result.diagnostics ??
+          this.getCommanderExperienceMethodDiagnostics(
+            Units.get(commander.id) ?? commander,
+          ),
+    };
+  }
+
   // Try direct stored-point mutation paths when commander XP itself refuses to move.
   applyCommanderStoredPointGrant(
     unitOrId,
@@ -2808,156 +2863,9 @@ export const Actions = new (class {
     );
   }
 
-  // Top a commander up only to the highest remaining promotion + commendation point totals so native counters never overflow.
+  // Preserve the old helper name, but use the direct configured XP burst because the safe-cap path proved unreliable.
   grantCommanderSafeXp(unitOrId) {
-    const commander = ComponentID.isValid(unitOrId)
-      ? Units.get(unitOrId)
-      : unitOrId;
-
-    if (!commander?.isCommanderUnit) {
-      return {
-        didChange: false,
-        reason: "not-commander",
-      };
-    }
-
-    const initialState = this.captureCommanderXpGrantState(commander);
-    const targetPromotionPoints = initialState.remainingPromotionCount;
-    const targetCommendations = initialState.remainingCommendationCount;
-
-    if (targetPromotionPoints <= 0 && targetCommendations <= 0) {
-      return {
-        didChange: false,
-        reason: "no-promotions-left",
-        initialState,
-        finalState: initialState,
-      };
-    }
-
-    if (this.hasCommanderXpGrantReachedCap(initialState)) {
-      return {
-        didChange: false,
-        reason: "already-capped",
-        initialState,
-        finalState: initialState,
-      };
-    }
-
-    const missingPromotionPoints = Math.max(
-      targetPromotionPoints - initialState.storedPromotionPoints,
-      0,
-    );
-    const missingCommendations = Math.max(
-      targetCommendations - initialState.storedCommendations,
-      0,
-    );
-    const maxIterations = Math.max(
-      missingPromotionPoints + missingCommendations,
-      0,
-    ) + 8;
-
-    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-      const liveCommander = Units.get(commander.id) ?? commander;
-      const beforeState = this.captureCommanderXpGrantState(liveCommander);
-
-      if (this.hasCommanderXpGrantReachedCap(beforeState)) {
-        break;
-      }
-
-      if (
-        !Number.isFinite(beforeState.experienceToNextLevel) ||
-        beforeState.experienceToNextLevel <= 0
-      ) {
-        break;
-      }
-
-      let afterState = beforeState;
-      let lastGrantResult = null;
-
-      for (const xpGrant of this.getCommanderXpGrantAttempts(beforeState)) {
-        lastGrantResult = this.applyCommanderExperienceGrant(
-          liveCommander,
-          xpGrant,
-          beforeState,
-        );
-        afterState = lastGrantResult.afterState ?? beforeState;
-
-        if (
-          this.hasCommanderXpGrantStateChanged(beforeState, afterState) ||
-          this.hasCommanderXpGrantReachedCap(afterState)
-        ) {
-          break;
-        }
-      }
-
-      if (!this.hasCommanderXpGrantStateChanged(beforeState, afterState)) {
-        const missingPromotionPoints = Math.max(
-          targetPromotionPoints - beforeState.storedPromotionPoints,
-          0,
-        );
-
-        if (missingPromotionPoints > 0) {
-          lastGrantResult = this.applyCommanderStoredPointGrant(
-            liveCommander,
-            "promotion",
-            missingPromotionPoints,
-            beforeState,
-          );
-          afterState = lastGrantResult.afterState ?? beforeState;
-        }
-      }
-
-      if (!this.hasCommanderXpGrantStateChanged(beforeState, afterState)) {
-        const missingCommendations = Math.max(
-          targetCommendations - beforeState.storedCommendations,
-          0,
-        );
-
-        if (missingCommendations > 0) {
-          lastGrantResult = this.applyCommanderStoredPointGrant(
-            liveCommander,
-            "commendation",
-            missingCommendations,
-            beforeState,
-          );
-          afterState = lastGrantResult.afterState ?? beforeState;
-        }
-      }
-
-      if (!this.hasCommanderXpGrantStateChanged(beforeState, afterState)) {
-        break;
-      }
-    }
-
-    const finalState = this.captureCommanderXpGrantState(
-      Units.get(commander.id) ?? commander,
-    );
-
-    return {
-      didChange:
-        finalState.storedPromotionPoints !== initialState.storedPromotionPoints ||
-        finalState.storedCommendations !== initialState.storedCommendations ||
-        finalState.level !== initialState.level ||
-        finalState.experiencePoints !== initialState.experiencePoints,
-      reason:
-        finalState.experiencePoints === initialState.experiencePoints &&
-          finalState.storedPromotionPoints === initialState.storedPromotionPoints &&
-          finalState.storedCommendations === initialState.storedCommendations
-          ? "no-xp-effect"
-          : this.hasCommanderXpGrantReachedCap(finalState)
-            ? "capped"
-            : "partial",
-      initialState,
-      finalState,
-      diagnostics:
-        finalState.experiencePoints === initialState.experiencePoints &&
-          finalState.storedPromotionPoints === initialState.storedPromotionPoints &&
-          finalState.storedCommendations === initialState.storedCommendations
-          ? this.getCommanderExperienceMethodDiagnostics(
-            Units.get(commander.id) ?? commander,
-          )
-          : null,
-    };
+    return this.grantCommanderXp(unitOrId);
   }
 
   // Collect every promotion or commendation node the commander could legally earn if it had the right point pool.
@@ -3337,7 +3245,7 @@ export const Actions = new (class {
     }
   }
 
-  // Buff one local unit for autoplay mastery, using the safe commander XP path where needed.
+  // Buff one local unit for autoplay mastery, granting the same direct XP burst to commanders too.
   boostUnitForAutoplayMastery(unitOrId) {
     const localPlayerId = this.getLocalPlayerId();
     const unit = ComponentID.isValid(unitOrId) ? Units.get(unitOrId) : unitOrId;
@@ -3349,7 +3257,7 @@ export const Actions = new (class {
     Units.setDamage(unit.id, 0);
 
     if (unit.isCommanderUnit) {
-      this.grantCommanderSafeXp(unit);
+      this.grantCommanderXp(unit);
       this.enqueueCommanderForAdmin(unit.id);
       return true;
     }
@@ -5560,37 +5468,25 @@ export const Actions = new (class {
   addXp() {
     const xpGrantLabel = this.militaryXpGrantAmount.toLocaleString();
     let regularUnitsBoosted = 0;
-    let commandersCapped = 0;
-    let commandersAlreadyCapped = 0;
-    let commandersPartiallyCapped = 0;
+    let commandersBoosted = 0;
     let commandersNoEffect = 0;
     const noEffectCommanderDiagnostics = [];
 
     // Iterate over a safe unit list so this action does nothing instead of crashing.
     for (const unit of this.getLocalUnits()) {
       if (unit?.isCommanderUnit) {
-        const result = this.grantCommanderSafeXp(unit);
+        const result = this.grantCommanderXp(unit);
 
         if (result.didChange) {
-          if (result.reason === "capped") {
-            commandersCapped += 1;
-          } else {
-            commandersPartiallyCapped += 1;
-          }
+          commandersBoosted += 1;
         } else {
-          if (
-            result.reason === "already-capped" ||
-            result.reason === "no-promotions-left"
-          ) {
-            commandersAlreadyCapped += 1;
-          } else {
-            commandersNoEffect += 1;
-            noEffectCommanderDiagnostics.push({
-              unit,
-              diagnostics: result.diagnostics,
-              finalState: result.finalState,
-            });
-          }
+          commandersNoEffect += 1;
+          noEffectCommanderDiagnostics.push({
+            unit,
+            appliedBy: result.appliedBy,
+            diagnostics: result.diagnostics,
+            finalState: result.finalState,
+          });
         }
 
         continue;
@@ -5602,7 +5498,7 @@ export const Actions = new (class {
     }
 
     console.log(
-      `Dev panel: safe ${xpGrantLabel} XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersCapped} commander(s) filled to their promotion/commendation cap, ${commandersPartiallyCapped} commander(s) advanced partway, ${commandersAlreadyCapped} commander(s) already at cap, ${commandersNoEffect} commander(s) showed no XP change.`,
+      `Dev panel: ${xpGrantLabel} XP applied to ${regularUnitsBoosted} regular unit(s) and ${commandersBoosted} commander(s); ${commandersNoEffect} commander(s) showed no XP change.`,
     );
 
     if (commandersNoEffect > 0) {
@@ -5612,7 +5508,7 @@ export const Actions = new (class {
 
       noEffectCommanderDiagnostics.slice(0, 3).forEach((entry) => {
         console.log(
-          `Dev panel: commander XP had no effect on ${this.getUnitDisplayName(entry.unit)} · xp=${entry.finalState?.experiencePoints}/${entry.finalState?.experienceToNextLevel} · storedPromotions=${entry.finalState?.storedPromotionPoints} · storedCommendations=${entry.finalState?.storedCommendations} · experienceMethods=${entry.diagnostics?.experienceMethods?.join(", ") || "none"} · unitMethods=${entry.diagnostics?.unitMethods?.join(", ") || "none"}`,
+          `Dev panel: commander XP had no effect on ${this.getUnitDisplayName(entry.unit)} · appliedBy=${entry.appliedBy || "none"} · xp=${entry.finalState?.experiencePoints}/${entry.finalState?.experienceToNextLevel} · storedPromotions=${entry.finalState?.storedPromotionPoints} · storedCommendations=${entry.finalState?.storedCommendations} · experienceMethods=${entry.diagnostics?.experienceMethods?.join(", ") || "none"} · unitMethods=${entry.diagnostics?.unitMethods?.join(", ") || "none"}`,
         );
       });
     }
