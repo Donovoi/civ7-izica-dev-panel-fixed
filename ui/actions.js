@@ -10,6 +10,9 @@ export const Actions = new (class {
   // Store action callbacks here after the methods have been bound to this singleton.
   map = {};
 
+  // Keep the shared unit and commander XP burst consistent across manual and autoplay helpers.
+  militaryXpGrantAmount = 200000;
+
   // Keep a FIFO queue of commanders that still need admin actions applied.
   commanderAdminQueue = [];
 
@@ -193,7 +196,7 @@ export const Actions = new (class {
     "toggle-infinite-movement": "Toggle infinite movement for your units.",
     "upgrade-all-units": "Upgrade every currently eligible local unit and commander in one sweep. Regular units use the stock Upgrade Unit command, while commanders spend promotions, commendations, and army upgrades through the existing commander-admin queue.",
     "heal-units": "Heal every alive player's unit, including packed and traveling units when possible.",
-    "add-xp": "Grant max safe XP to every local unit. Regular units still get a huge XP boost, but commanders stop at their remaining promotion-point cap to avoid overflowing native counters.",
+    "add-xp": "Grant a safe 200,000 XP burst to every local unit. Regular units get 200,000 XP directly, while commanders still stop at their remaining promotion and commendation cap to avoid overflowing native counters.",
     "clear-all-logs": "Clear the mirrored dev console buffer and every stored profiler session log so the next repro starts from a clean slate.",
     "sleep-all-units": "Put every local unit to sleep.",
     "complete-tech": "Finish the active technology.",
@@ -2475,25 +2478,29 @@ export const Actions = new (class {
 
   // Build a tiny list of commander XP grant attempts that cover the likely native interpretations without going nuclear.
   getCommanderXpGrantAttempts(state) {
+    const maxXpGrant = Math.max(Math.ceil(this.militaryXpGrantAmount), 1);
     const xpNeededForNextLevel = Math.max(
-      Math.ceil(state.experienceToNextLevel - state.experiencePoints),
+      Math.min(
+        Math.ceil(state.experienceToNextLevel - state.experiencePoints),
+        maxXpGrant,
+      ),
       1,
     );
     const fallbackXpThreshold = Math.max(
-      Math.ceil(state.experienceToNextLevel),
+      Math.min(Math.ceil(state.experienceToNextLevel), maxXpGrant),
       1,
     );
     const paddedFallbackXp = Math.min(
       Math.max(Math.ceil(fallbackXpThreshold * 1.5), 10),
-      5000,
+      maxXpGrant,
     );
 
     return [...new Set([
       xpNeededForNextLevel,
       fallbackXpThreshold,
       paddedFallbackXp,
-      25000,
-      100000,
+      Math.min(25000, maxXpGrant),
+      maxXpGrant,
     ])].filter((value) => Number.isFinite(value) && value > 0);
   }
 
@@ -3347,7 +3354,7 @@ export const Actions = new (class {
       return true;
     }
 
-    Units.changeExperience(unit.id, 10000000);
+    Units.changeExperience(unit.id, this.militaryXpGrantAmount);
     return true;
   }
 
@@ -5551,6 +5558,7 @@ export const Actions = new (class {
   }
 
   addXp() {
+    const xpGrantLabel = this.militaryXpGrantAmount.toLocaleString();
     let regularUnitsBoosted = 0;
     let commandersCapped = 0;
     let commandersAlreadyCapped = 0;
@@ -5588,13 +5596,13 @@ export const Actions = new (class {
         continue;
       }
 
-      // Grant a huge amount of experience so non-command units level immediately.
-      Units.changeExperience(unit.id, 10000000);
+      // Grant the configured military XP burst so non-command units level quickly without going absurdly nuclear.
+      Units.changeExperience(unit.id, this.militaryXpGrantAmount);
       regularUnitsBoosted += 1;
     }
 
     console.log(
-      `Dev panel: max safe XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersCapped} commander(s) filled to their promotion/commendation cap, ${commandersPartiallyCapped} commander(s) advanced partway, ${commandersAlreadyCapped} commander(s) already at cap, ${commandersNoEffect} commander(s) showed no XP change.`,
+      `Dev panel: safe ${xpGrantLabel} XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersCapped} commander(s) filled to their promotion/commendation cap, ${commandersPartiallyCapped} commander(s) advanced partway, ${commandersAlreadyCapped} commander(s) already at cap, ${commandersNoEffect} commander(s) showed no XP change.`,
     );
 
     if (commandersNoEffect > 0) {
