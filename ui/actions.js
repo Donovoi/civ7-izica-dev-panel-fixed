@@ -2473,6 +2473,28 @@ export const Actions = new (class {
     );
   }
 
+  // Build a tiny list of commander XP grant attempts that cover the likely native interpretations without going nuclear.
+  getCommanderXpGrantAttempts(state) {
+    const xpNeededForNextLevel = Math.max(
+      Math.ceil(state.experienceToNextLevel - state.experiencePoints),
+      1,
+    );
+    const fallbackXpThreshold = Math.max(
+      Math.ceil(state.experienceToNextLevel),
+      1,
+    );
+    const paddedFallbackXp = Math.min(
+      Math.max(Math.ceil(fallbackXpThreshold * 1.5), 10),
+      5000,
+    );
+
+    return [...new Set([
+      xpNeededForNextLevel,
+      fallbackXpThreshold,
+      paddedFallbackXp,
+    ])].filter((value) => Number.isFinite(value) && value > 0);
+  }
+
   // Check whether one commander XP snapshot visibly advanced level-up progress.
   hasCommanderXpGrantAdvanced(beforeState, afterState) {
     return (
@@ -2554,33 +2576,19 @@ export const Actions = new (class {
         break;
       }
 
-      const xpNeededForNextLevel = Math.max(
-        Math.ceil(
-          beforeState.experienceToNextLevel - beforeState.experiencePoints,
-        ),
-        1,
-      );
+      let afterState = beforeState;
 
-      Units.changeExperience(liveCommander.id, xpNeededForNextLevel);
-
-      let afterState = this.captureCommanderXpGrantState(
-        Units.get(liveCommander.id) ?? liveCommander,
-      );
-
-      if (
-        !this.hasCommanderXpGrantAdvanced(beforeState, afterState) &&
-        this.hasCommanderXpGrantStateChanged(beforeState, afterState)
-      ) {
-        const fallbackXpGrant = Math.max(
-          Math.ceil(afterState.experienceToNextLevel),
-          1,
+      for (const xpGrant of this.getCommanderXpGrantAttempts(beforeState)) {
+        Units.changeExperience(liveCommander.id, xpGrant);
+        afterState = this.captureCommanderXpGrantState(
+          Units.get(liveCommander.id) ?? liveCommander,
         );
 
-        if (fallbackXpGrant !== xpNeededForNextLevel) {
-          Units.changeExperience(liveCommander.id, fallbackXpGrant);
-          afterState = this.captureCommanderXpGrantState(
-            Units.get(liveCommander.id) ?? liveCommander,
-          );
+        if (
+          this.hasCommanderXpGrantStateChanged(beforeState, afterState) ||
+          this.hasCommanderXpGrantReachedCap(afterState)
+        ) {
+          break;
         }
       }
 
@@ -2599,7 +2607,9 @@ export const Actions = new (class {
         finalState.storedCommendations !== initialState.storedCommendations ||
         finalState.level !== initialState.level ||
         finalState.experiencePoints !== initialState.experiencePoints,
-      reason: this.hasCommanderXpGrantReachedCap(finalState) ? "capped" : "partial",
+      reason: this.hasCommanderXpGrantReachedCap(finalState)
+        ? "capped"
+        : "partial",
       initialState,
       finalState,
     };
@@ -3249,10 +3259,12 @@ export const Actions = new (class {
       `Commander type: ${commander.type ?? "unknown"}`,
       `Promotion class: ${commanderDefinition?.PromotionClass ?? "unknown"}`,
       `Level: ${xpState.level}`,
+      `XP progress: ${xpState.experiencePoints} / ${xpState.experienceToNextLevel}`,
       `Stored promotion points: ${xpState.storedPromotionPoints}`,
       `Stored commendations: ${xpState.storedCommendations}`,
       `Remaining regular promotions: ${xpState.remainingPromotionCount}`,
       `Remaining commendations: ${xpState.remainingCommendationCount}`,
+      `Promotion/commendation cap reached: ${this.hasCommanderXpGrantReachedCap(xpState) ? "yes" : "no"}`,
       `Native canPromote: ${adminState.canPromote ? "yes" : "no"}`,
       `Detected available actions: ${availableActions.length}`,
       "Available actions:",
@@ -5160,6 +5172,7 @@ export const Actions = new (class {
     let commandersCapped = 0;
     let commandersAlreadyCapped = 0;
     let commandersPartiallyCapped = 0;
+    let commandersNoEffect = 0;
 
     // Iterate over a safe unit list so this action does nothing instead of crashing.
     for (const unit of this.getLocalUnits()) {
@@ -5173,7 +5186,14 @@ export const Actions = new (class {
             commandersPartiallyCapped += 1;
           }
         } else {
-          commandersAlreadyCapped += 1;
+          if (
+            result.reason === "already-capped" ||
+            result.reason === "no-promotions-left"
+          ) {
+            commandersAlreadyCapped += 1;
+          } else {
+            commandersNoEffect += 1;
+          }
         }
 
         continue;
@@ -5185,8 +5205,14 @@ export const Actions = new (class {
     }
 
     console.log(
-      `Dev panel: max safe XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersCapped} commander(s) filled to their promotion/commendation cap, ${commandersPartiallyCapped} commander(s) advanced partway, ${commandersAlreadyCapped} commander(s) already at cap.`,
+      `Dev panel: max safe XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersCapped} commander(s) filled to their promotion/commendation cap, ${commandersPartiallyCapped} commander(s) advanced partway, ${commandersAlreadyCapped} commander(s) already at cap, ${commandersNoEffect} commander(s) showed no XP change.`,
     );
+
+    if (commandersNoEffect > 0) {
+      console.log(
+        `Dev panel: ${commandersNoEffect} commander(s) showed no XP change; inspect one with the commander inspector for raw XP and action details.`,
+      );
+    }
   }
 
   sleepAllUnits() {
