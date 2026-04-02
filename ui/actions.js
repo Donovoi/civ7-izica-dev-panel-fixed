@@ -3330,7 +3330,7 @@ export const Actions = new (class {
     }
 
     if (this.readNativeBooleanCandidates(experience, ["canPromote", "getCanPromote"])) {
-      return potentialCandidates
+      const rankedCandidates = potentialCandidates
         .map((candidate) => ({
           candidate,
           canStart: this.canStartCommanderPromotionCandidate(
@@ -3339,8 +3339,25 @@ export const Actions = new (class {
             allowTemporarySelection,
           ),
         }))
-        .sort((left, right) => Number(right.canStart) - Number(left.canStart))
-        .map((entry) => entry.candidate);
+        .sort((left, right) => {
+          const commendationWeight =
+            Number(left.candidate.promotion?.Commendation) -
+            Number(right.candidate.promotion?.Commendation);
+
+          if (commendationWeight !== 0) {
+            return commendationWeight;
+          }
+
+          return Number(right.canStart) - Number(left.canStart);
+        });
+      const regularPromotionCandidates = rankedCandidates.filter(
+        (entry) => !entry.candidate.promotion?.Commendation,
+      );
+
+      return (regularPromotionCandidates.length > 0
+        ? regularPromotionCandidates
+        : rankedCandidates
+      ).map((entry) => entry.candidate);
     }
 
     return [];
