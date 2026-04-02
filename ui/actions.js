@@ -2497,6 +2497,49 @@ export const Actions = new (class {
     ])].filter((value) => Number.isFinite(value) && value > 0);
   }
 
+  // Resolve the stock commander promotion command type, preferring the live enum when it is exposed.
+  getCommanderPromoteCommandType() {
+    return globalThis.UnitCommandTypes?.PROMOTE ?? "UNITCOMMAND_PROMOTE";
+  }
+
+  // Resolve the native-backed commander point field name used by one fallback mutation path.
+  getCommanderStoredPointFieldName(pointKind) {
+    return pointKind === "commendation"
+      ? "storedCommendations"
+      : "storedPromotionPoints";
+  }
+
+  // List the most likely native mutation method names for direct commander point grants.
+  getCommanderStoredPointMutationMethods(pointKind) {
+    if (pointKind === "commendation") {
+      return [
+        "changeStoredCommendations",
+        "addStoredCommendations",
+        "grantStoredCommendations",
+        "setStoredCommendations",
+        "changeCommendationPoints",
+        "addCommendationPoints",
+        "grantCommendationPoints",
+        "setCommendationPoints",
+        "changeCommendations",
+        "addCommendations",
+        "grantCommendations",
+        "setCommendations",
+      ];
+    }
+
+    return [
+      "changeStoredPromotionPoints",
+      "addStoredPromotionPoints",
+      "grantStoredPromotionPoints",
+      "setStoredPromotionPoints",
+      "changePromotionPoints",
+      "addPromotionPoints",
+      "grantPromotionPoints",
+      "setPromotionPoints",
+    ];
+  }
+
   // Return just the interesting native method names that look related to commander XP or promotions.
   getCommanderExperienceMethodDiagnostics(commander) {
     const experienceMethods = this.getCallablePropertyNames(
@@ -2637,6 +2680,109 @@ export const Actions = new (class {
     };
   }
 
+  // Try direct stored-point mutation paths when commander XP itself refuses to move.
+  applyCommanderStoredPointGrant(
+    unitOrId,
+    pointKind,
+    amount,
+    beforeState = null,
+  ) {
+    const commander = ComponentID.isValid(unitOrId)
+      ? Units.get(unitOrId)
+      : unitOrId;
+
+    if (!commander?.isCommanderUnit || !Number.isFinite(amount) || amount <= 0) {
+      const fallbackState = commander
+        ? this.captureCommanderXpGrantState(commander)
+        : null;
+
+      return {
+        didChange: false,
+        beforeState: beforeState ?? fallbackState,
+        afterState: fallbackState,
+        appliedBy: "none",
+        diagnostics: commander
+          ? this.getCommanderExperienceMethodDiagnostics(commander)
+          : {
+            experienceMethods: [],
+            unitMethods: [],
+          },
+      };
+    }
+
+    const initialState = beforeState ?? this.captureCommanderXpGrantState(commander);
+    const stateFieldName = this.getCommanderStoredPointFieldName(pointKind);
+    const currentValue = Number(initialState[stateFieldName] ?? 0);
+    const delta = Math.max(Math.ceil(amount), 1);
+    const targetValue = currentValue + delta;
+    const captureAfterState = () =>
+      this.captureCommanderXpGrantState(Units.get(commander.id) ?? commander);
+    const mutationWorked = (afterState) =>
+      Number(afterState?.[stateFieldName] ?? 0) > currentValue ||
+      this.hasCommanderXpGrantReachedCap(afterState);
+    const tryMutation = (target, methodName, args) => {
+      if (!target || typeof target[methodName] !== "function") {
+        return null;
+      }
+
+      try {
+        target[methodName](...args);
+      } catch (_error) {
+        return null;
+      }
+
+      const afterState = captureAfterState();
+
+      if (!mutationWorked(afterState)) {
+        return null;
+      }
+
+      return {
+        didChange: true,
+        beforeState: initialState,
+        afterState,
+        appliedBy: methodName,
+      };
+    };
+
+    const methodAttempts = [
+      {
+        target: commander.Experience,
+        methods: this.getCommanderStoredPointMutationMethods(pointKind),
+      },
+      {
+        target: commander,
+        methods: this.getCommanderStoredPointMutationMethods(pointKind),
+      },
+    ];
+
+    for (const attempt of methodAttempts) {
+      for (const methodName of attempt.methods) {
+        const argsList = /^set/i.test(methodName)
+          ? [[targetValue], [delta]]
+          : [[delta]];
+
+        for (const args of argsList) {
+          const result = tryMutation(attempt.target, methodName, args);
+
+          if (result) {
+            return result;
+          }
+        }
+      }
+    }
+
+    return {
+      didChange: false,
+      beforeState: initialState,
+      afterState: captureAfterState(),
+      appliedBy: "none",
+      diagnostics: this.getCommanderExperienceMethodDiagnostics(
+        Units.get(commander.id) ?? commander,
+      ),
+    };
+  }
+
   // Check whether one commander XP snapshot visibly advanced level-up progress.
   hasCommanderXpGrantAdvanced(beforeState, afterState) {
     return (
@@ -2738,6 +2884,40 @@ export const Actions = new (class {
       }
 
       if (!this.hasCommanderXpGrantStateChanged(beforeState, afterState)) {
+        const missingPromotionPoints = Math.max(
+          targetPromotionPoints - beforeState.storedPromotionPoints,
+          0,
+        );
+
+        if (missingPromotionPoints > 0) {
+          lastGrantResult = this.applyCommanderStoredPointGrant(
+            liveCommander,
+            "promotion",
+            missingPromotionPoints,
+            beforeState,
+          );
+          afterState = lastGrantResult.afterState ?? beforeState;
+        }
+      }
+
+      if (!this.hasCommanderXpGrantStateChanged(beforeState, afterState)) {
+        const missingCommendations = Math.max(
+          targetCommendations - beforeState.storedCommendations,
+          0,
+        );
+
+        if (missingCommendations > 0) {
+          lastGrantResult = this.applyCommanderStoredPointGrant(
+            liveCommander,
+            "commendation",
+            missingCommendations,
+            beforeState,
+          );
+          afterState = lastGrantResult.afterState ?? beforeState;
+        }
+      }
+
+      if (!this.hasCommanderXpGrantStateChanged(beforeState, afterState)) {
         break;
       }
     }
@@ -2773,8 +2953,8 @@ export const Actions = new (class {
     };
   }
 
-  // Collect every currently available promotion or commendation for a commander.
-  getCommanderPromotionCandidates(commander, allowTemporarySelection = false) {
+  // Collect every promotion or commendation node the commander could legally earn if it had the right point pool.
+  getCommanderPotentialPromotionCandidates(commander, allowTemporarySelection = false) {
     const experience = commander?.Experience;
 
     if (!experience) {
@@ -2786,6 +2966,8 @@ export const Actions = new (class {
     if (!unitDefinition?.PromotionClass) {
       return [];
     }
+
+    const promoteCommandType = this.getCommanderPromoteCommandType();
 
     return this.getPromotionMetadataForClass(unitDefinition.PromotionClass).filter(
       (candidate) => {
@@ -2806,7 +2988,7 @@ export const Actions = new (class {
         if (
           this.canStartUnitCommand(
             commander.id,
-            "UNITCOMMAND_PROMOTE",
+            promoteCommandType,
             promotionArgs,
             allowTemporarySelection,
           )?.Success
@@ -2833,6 +3015,37 @@ export const Actions = new (class {
     );
   }
 
+  // Collect every currently available promotion or commendation for a commander.
+  getCommanderPromotionCandidates(commander, allowTemporarySelection = false) {
+    const experience = commander?.Experience;
+
+    if (!experience) {
+      return [];
+    }
+
+    const storedPromotionPoints = this.readNativeNumber(
+      experience,
+      "getStoredPromotionPoints",
+    );
+    const storedCommendations = this.readNativeNumber(
+      experience,
+      "getStoredCommendations",
+    );
+
+    if (storedPromotionPoints <= 0 && storedCommendations <= 0) {
+      return [];
+    }
+
+    return this.getCommanderPotentialPromotionCandidates(
+      commander,
+      allowTemporarySelection,
+    ).filter((candidate) =>
+      candidate.promotion?.Commendation
+        ? storedCommendations > 0
+        : storedPromotionPoints > 0,
+    );
+  }
+
   // Choose the next automatic commander admin action, prioritizing promotions and commendations first.
   getNextCommanderAdminAction(commander, allowTemporarySelection = false) {
     return this.getCommanderAdminActions(commander, allowTemporarySelection)[0] ?? null;
@@ -2845,7 +3058,11 @@ export const Actions = new (class {
       PromotionDisciplineType: Database.makeHash(candidate.disciplineType),
     };
 
-    return this.sendUnitCommand(unitId, "UNITCOMMAND_PROMOTE", args);
+    return this.sendUnitCommand(
+      unitId,
+      this.getCommanderPromoteCommandType(),
+      args,
+    );
   }
 
   // Send a generic commander command such as "upgrade army".
@@ -3401,6 +3618,10 @@ export const Actions = new (class {
     const commanderDefinition = GameInfo.Units.lookup(commander.type);
     const xpState = this.captureCommanderXpGrantState(commander);
     const adminState = this.captureCommanderAdminState(commander);
+    const potentialPromotionCandidates = this.getCommanderPotentialPromotionCandidates(
+      commander,
+      true,
+    );
     const availableActions = this.getCommanderAdminActions(commander, true);
     const methodDiagnostics = this.getCommanderExperienceMethodDiagnostics(commander);
     const availableActionBlock = availableActions.length > 0
@@ -3425,9 +3646,10 @@ export const Actions = new (class {
       `Remaining commendations: ${xpState.remainingCommendationCount}`,
       `Promotion/commendation cap reached: ${this.hasCommanderXpGrantReachedCap(xpState) ? "yes" : "no"}`,
       `Native canPromote: ${adminState.canPromote ? "yes" : "no"}`,
+      `Potential tree actions (ignoring stored-point affordability): ${potentialPromotionCandidates.length}`,
       `Experience methods: ${methodDiagnostics.experienceMethods.join(", ") || "none found"}`,
       `Unit methods: ${methodDiagnostics.unitMethods.join(", ") || "none found"}`,
-      `Detected available actions: ${availableActions.length}`,
+      `Detected spendable actions: ${availableActions.length}`,
       "Available actions:",
       availableActionBlock,
     ].join("\n");
