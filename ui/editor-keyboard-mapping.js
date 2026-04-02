@@ -17,6 +17,7 @@ const ACTIONS = [
     'complete-all-research-civics',
     'toggle-infinite-movement',
     'reinforce-all-units',
+    'inspect-selected-commander',
     'upgrade-all-units',
     'heal-units',
     'add-xp',

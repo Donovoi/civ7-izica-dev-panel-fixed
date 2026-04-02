@@ -188,6 +188,7 @@ export const Actions = new (class {
     "add-population": "Add 1 rural population to every city.",
     "spawn-settler": "Spawn a settler at your capital.",
     "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or formation upgrades, including land, naval, and air commanders.",
+    "inspect-selected-commander": "Log the selected commander, or the selected unit's commander, including level, stored promotion points, stored commendations, remaining promotions, remaining commendations, and currently detected upgrade actions.",
     "reinforce-all-units": "Send every eligible land, sea, and air unit to a valid commander.",
     "toggle-infinite-movement": "Toggle infinite movement for your units.",
     "upgrade-all-units": "Upgrade every currently eligible local unit and commander in one sweep. Regular units use the stock Upgrade Unit command, while commanders spend promotions, commendations, and army upgrades through the existing commander-admin queue.",
@@ -260,6 +261,7 @@ export const Actions = new (class {
     this.revealMap = this.revealMap.bind(this);
     this.meetAll = this.meetAll.bind(this);
     this.upgradeSelectedCommander = this.upgradeSelectedCommander.bind(this);
+    this.inspectSelectedCommander = this.inspectSelectedCommander.bind(this);
     this.reinforceAllAvailableUnits = this.reinforceAllAvailableUnits.bind(this);
     this.refreshSelectedUnitUI = this.refreshSelectedUnitUI.bind(this);
     this.finishManualAdminStatusIfIdle = this.finishManualAdminStatusIfIdle.bind(this);
@@ -345,6 +347,9 @@ export const Actions = new (class {
 
       // Spend every available promotion, commendation, and formation upgrade across all commanders.
       "upgrade-commander": this.upgradeSelectedCommander,
+
+      // Dump the current selected commander's upgrade/debug state into the mirrored logs.
+      "inspect-selected-commander": this.inspectSelectedCommander,
 
       // Assign every currently reinforceable unit to a valid commander plot.
       "reinforce-all-units": this.reinforceAllAvailableUnits,
@@ -558,6 +563,40 @@ export const Actions = new (class {
   // Resolve the commander associated with the current selection.
   getSelectedCommander() {
     return this.getCommanderForUnit(this.getSelectedUnit());
+  }
+
+  // Resolve a readable label for one promotion or commendation candidate.
+  getCommanderPromotionCandidateLabel(candidate) {
+    if (!candidate) {
+      return "Unknown promotion";
+    }
+
+    const promotionName = this.resolveDisplayText(
+      candidate.promotion?.Name,
+      candidate.promotionType,
+    );
+    const candidateKind = candidate.promotion?.Commendation
+      ? "Commendation"
+      : "Promotion";
+
+    return `${candidateKind}: ${promotionName} (${candidate.promotionType})`;
+  }
+
+  // Resolve a readable label for one detected commander admin action.
+  getCommanderAdminActionLabel(action) {
+    if (!action) {
+      return "Unknown action";
+    }
+
+    if (action.kind === "promotion") {
+      return this.getCommanderPromotionCandidateLabel(action.candidate);
+    }
+
+    if (action.commandType === "UNITCOMMAND_UPGRADE_ARMY") {
+      return "Command: Upgrade army";
+    }
+
+    return `Command: ${action.commandType ?? "unknown"}`;
   }
 
   // Find the dev-panel status line for commander/admin tasks.
@@ -3171,6 +3210,62 @@ export const Actions = new (class {
     this.setCommanderStatus(`Reinforcing units… 0 reinforced, 0 skipped, ${reinforceableUnits} left to try`);
     console.log(`Dev panel: reinforcing ${reinforceableUnits} available unit(s).`);
     this.processAdminQueues();
+  }
+
+  // Dump the current selected commander state into the mirrored logs for surgical debugging.
+  inspectSelectedCommander() {
+    const selectedUnit = this.getSelectedUnit();
+    const commander = this.getSelectedCommander();
+
+    if (!selectedUnit || !commander) {
+      this.setCommanderStatus(
+        "Select a commander or one of its attached units first.",
+      );
+      console.log(
+        "Dev panel: commander inspection failed — no selected commander or attached unit.",
+      );
+      this.scheduleCommanderStatusReset(4000);
+      return;
+    }
+
+    const selectedUnitLabel = this.getUnitDisplayName(selectedUnit);
+    const commanderLabel = this.getUnitDisplayName(commander);
+    const commanderDefinition = GameInfo.Units.lookup(commander.type);
+    const xpState = this.captureCommanderXpGrantState(commander);
+    const adminState = this.captureCommanderAdminState(commander);
+    const availableActions = this.getCommanderAdminActions(commander, true);
+    const availableActionBlock = availableActions.length > 0
+      ? availableActions
+        .map(
+          (action, index) =>
+            `  ${index + 1}. ${this.getCommanderAdminActionLabel(action)}`,
+        )
+        .join("\n")
+      : "  none";
+    const inspectionLog = [
+      "Dev panel: commander inspection",
+      `Selected unit: ${selectedUnitLabel}${this.isSameComponentId(selectedUnit.id, commander.id) ? " (commander)" : " (attached unit)"}`,
+      `Commander: ${commanderLabel}`,
+      `Commander type: ${commander.type ?? "unknown"}`,
+      `Promotion class: ${commanderDefinition?.PromotionClass ?? "unknown"}`,
+      `Level: ${xpState.level}`,
+      `Stored promotion points: ${xpState.storedPromotionPoints}`,
+      `Stored commendations: ${xpState.storedCommendations}`,
+      `Remaining regular promotions: ${xpState.remainingPromotionCount}`,
+      `Remaining commendations: ${xpState.remainingCommendationCount}`,
+      `Native canPromote: ${adminState.canPromote ? "yes" : "no"}`,
+      `Detected available actions: ${availableActions.length}`,
+      "Available actions:",
+      availableActionBlock,
+    ].join("\n");
+
+    console.log(inspectionLog);
+    this.setCommanderStatus(
+      availableActions.length > 0
+        ? `Commander inspection logged — ${availableActions.length} action(s) available for ${commanderLabel}.`
+        : `Commander inspection logged — no actions detected for ${commanderLabel}.`,
+    );
+    this.scheduleCommanderStatusReset(5000);
   }
 
   // Fire a one-click empire tune-up that chains together the highest-value maintenance cheats.

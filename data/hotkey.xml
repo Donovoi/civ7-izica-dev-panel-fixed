@@ -1,71 +1,137 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Database>
     <InputActions>
-        <Row ActionId="toggle-dev-panel" Name="DEVPANEL - Toggle panel" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="toggle-dev-console" Name="DEVPANEL - Toggle dev console" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="toggle-fast-gameplay" Name="DEVPANEL - Toggle fast gameplay" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="toggle-performance-profiler" Name="DEVPANEL - Toggle performance profiler" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="copy-all-logs" Name="DEVPANEL - Copy all logs" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="clear-all-logs" Name="DEVPANEL - Clear all logs" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="run-empire-maintenance" Name="DEVPANEL - Run empire maintenance" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="reload-ui" Name="DEVPANEL - Reload UI" DeviceType="Keyboard"  Description="DEVPANEL" />
-        <Row ActionId="toggle-infinite-movement" Name="DEVPANEL - Toggle infinite movement" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="complete-production" Name="DEVPANEL - Complete cities production" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="add-population" Name="DEVPANEL - Grow all cities" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="complete-tech" Name="DEVPANEL - Complete tech" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="complete-civic" Name="DEVPANEL - Complete civic" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="complete-all-research-civics" Name="DEVPANEL - Complete all research and civics" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="reinforce-all-units" Name="DEVPANEL - Reinforce all units" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="upgrade-all-units" Name="DEVPANEL - Upgrade all military" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="heal-units" Name="DEVPANEL - Heal all units" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="add-xp" Name="DEVPANEL - Max safe XP" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="add-gold" Name="DEVPANEL - Add gold" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="add-influence" Name="DEVPANEL - Add influence" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="add-happiness" Name="DEVPANEL - Add happiness" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="add-wildcard-attribute-point" Name="DEVPANEL - Add wildcard attribute point" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="start-golden-age" Name="DEVPANEL - Start celebration" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="spawn-settler" Name="DEVPANEL - Spawn settler in capital" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="toggle-autoplay-mastery" Name="DEVPANEL - Toggle autoplay mastery" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="cycle-autoplay-bias" Name="DEVPANEL - Cycle autoplay bias" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="reveal-map" Name="DEVPANEL - Reveal map" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="meet-all" Name="DEVPANEL - Meet all" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="transition-to-next-age" Name="DEVPANEL - Transition to next age" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="font-increase" Name="DEVPANEL - Increase panel size" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="font-decrease" Name="DEVPANEL - Decrease panel size" DeviceType="Keyboard" Description="DEVPANEL" />
-        <Row ActionId="reset-panel-size" Name="DEVPANEL - Reset panel size" DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="toggle-dev-panel" Name="DEVPANEL - Toggle panel" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="toggle-dev-console" Name="DEVPANEL - Toggle dev console"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="toggle-fast-gameplay" Name="DEVPANEL - Toggle fast gameplay"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="toggle-performance-profiler" Name="DEVPANEL - Toggle performance profiler"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="copy-all-logs" Name="DEVPANEL - Copy all logs" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="clear-all-logs" Name="DEVPANEL - Clear all logs" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="run-empire-maintenance" Name="DEVPANEL - Run empire maintenance"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="reload-ui" Name="DEVPANEL - Reload UI" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="toggle-infinite-movement" Name="DEVPANEL - Toggle infinite movement"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="complete-production" Name="DEVPANEL - Complete cities production"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="add-population" Name="DEVPANEL - Grow all cities" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="complete-tech" Name="DEVPANEL - Complete tech" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="complete-civic" Name="DEVPANEL - Complete civic" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="complete-all-research-civics"
+            Name="DEVPANEL - Complete all research and civics" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="reinforce-all-units" Name="DEVPANEL - Reinforce all units"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="inspect-selected-commander" Name="DEVPANEL - Inspect selected commander"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="upgrade-all-units" Name="DEVPANEL - Upgrade all military"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="heal-units" Name="DEVPANEL - Heal all units" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="add-xp" Name="DEVPANEL - Max safe XP" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="add-gold" Name="DEVPANEL - Add gold" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="add-influence" Name="DEVPANEL - Add influence" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="add-happiness" Name="DEVPANEL - Add happiness" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="add-wildcard-attribute-point" Name="DEVPANEL - Add wildcard attribute point"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="start-golden-age" Name="DEVPANEL - Start celebration" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="spawn-settler" Name="DEVPANEL - Spawn settler in capital"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="toggle-autoplay-mastery" Name="DEVPANEL - Toggle autoplay mastery"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="cycle-autoplay-bias" Name="DEVPANEL - Cycle autoplay bias"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="reveal-map" Name="DEVPANEL - Reveal map" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="meet-all" Name="DEVPANEL - Meet all" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="transition-to-next-age" Name="DEVPANEL - Transition to next age"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="font-increase" Name="DEVPANEL - Increase panel size" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="font-decrease" Name="DEVPANEL - Decrease panel size" DeviceType="Keyboard"
+            Description="DEVPANEL" />
+        <Row ActionId="reset-panel-size" Name="DEVPANEL - Reset panel size" DeviceType="Keyboard"
+            Description="DEVPANEL" />
     </InputActions>
     <InputActionDefaultGestures>
         <Row ActionId="toggle-dev-panel" Index="0" GestureType="KBMouse" GestureData="KEY_B" />
-        <Row ActionId="toggle-dev-console" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_C" />
-        <Row ActionId="toggle-fast-gameplay" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_F" />
-        <Row ActionId="toggle-performance-profiler" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_P" />
-        <Row ActionId="copy-all-logs" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_L" />
-        <Row ActionId="clear-all-logs" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_K" />
-        <Row ActionId="run-empire-maintenance" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_O" />
+        <Row ActionId="toggle-dev-console" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_C" />
+        <Row ActionId="toggle-fast-gameplay" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_F" />
+        <Row ActionId="toggle-performance-profiler" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_P" />
+        <Row ActionId="copy-all-logs" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_L" />
+        <Row ActionId="clear-all-logs" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_K" />
+        <Row ActionId="run-empire-maintenance" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_O" />
         <Row ActionId="reload-ui" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_R" />
-        <Row ActionId="toggle-infinite-movement" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_V" />
-        <Row ActionId="complete-production" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_D" />
-        <Row ActionId="add-population" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_N" />
-        <Row ActionId="complete-tech" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_Z" />
-        <Row ActionId="complete-civic" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_X" />
-        <Row ActionId="complete-all-research-civics" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_T" />
-        <Row ActionId="reinforce-all-units" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_A" />
-        <Row ActionId="upgrade-all-units" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_U" />
-        <Row ActionId="heal-units" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_H" />
-        <Row ActionId="add-xp" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_E" />
+        <Row ActionId="toggle-infinite-movement" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_V" />
+        <Row ActionId="complete-production" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_D" />
+        <Row ActionId="add-population" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_N" />
+        <Row ActionId="complete-tech" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_Z" />
+        <Row ActionId="complete-civic" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_X" />
+        <Row ActionId="complete-all-research-civics" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_T" />
+        <Row ActionId="reinforce-all-units" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_A" />
+        <Row ActionId="inspect-selected-commander" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_J" />
+        <Row ActionId="upgrade-all-units" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_U" />
+        <Row ActionId="heal-units" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_H" />
+        <Row ActionId="add-xp" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_E" />
         <Row ActionId="add-gold" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_G" />
-        <Row ActionId="add-influence" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_H" />
-        <Row ActionId="add-happiness" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_I" />
-        <Row ActionId="add-wildcard-attribute-point" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_W" />
-        <Row ActionId="start-golden-age" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_G" />
-        <Row ActionId="spawn-settler" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_S" />
-        <Row ActionId="toggle-autoplay-mastery" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_M" />
-        <Row ActionId="cycle-autoplay-bias" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_Y" />
-        <Row ActionId="reveal-map" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_R" />
-        <Row ActionId="meet-all" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_F1" />
-        <Row ActionId="transition-to-next-age" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_F2" />
-        <Row ActionId="font-increase" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_0" />
-        <Row ActionId="font-decrease" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_9" />
-        <Row ActionId="reset-panel-size" Index="0" GestureType="KBMouse" GestureData="KEY_LCONTROL+KEY_1" />
+        <Row ActionId="add-influence" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_H" />
+        <Row ActionId="add-happiness" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_I" />
+        <Row ActionId="add-wildcard-attribute-point" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_W" />
+        <Row ActionId="start-golden-age" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_G" />
+        <Row ActionId="spawn-settler" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_S" />
+        <Row ActionId="toggle-autoplay-mastery" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_M" />
+        <Row ActionId="cycle-autoplay-bias" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_Y" />
+        <Row ActionId="reveal-map" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_R" />
+        <Row ActionId="meet-all" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_F1" />
+        <Row ActionId="transition-to-next-age" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_F2" />
+        <Row ActionId="font-increase" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_0" />
+        <Row ActionId="font-decrease" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_9" />
+        <Row ActionId="reset-panel-size" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_1" />
     </InputActionDefaultGestures>
 </Database>
