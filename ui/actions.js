@@ -1,4 +1,5 @@
 import ContextManager from "/core/ui/context-manager/context-manager.js";
+import { InterfaceMode } from "/core/ui/interface-modes/interface-modes.js";
 import { C as ComponentID } from "/core/ui/utilities/utilities-component-id.chunk.js";
 
 import { Storage } from "./storage.js";
@@ -840,6 +841,215 @@ export const Actions = new (class {
     }
 
     return false;
+  }
+
+  // Trigger one stock FXS action the same way a manual UI activation would.
+  activateUiAction(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+
+    element.dispatchEvent(new Event("mouseenter", { bubbles: true }));
+    element.dispatchEvent(new Event("focus", { bubbles: true }));
+
+    if (typeof element.focus === "function") {
+      element.focus();
+    }
+
+    return element.dispatchEvent(
+      new Event("action-activate", { bubbles: true, cancelable: true }),
+    );
+  }
+
+  // Return the live stock commander-promotion panel if it is currently mounted.
+  getCommanderPromotionPanelElement() {
+    return document.querySelector(".panel-unit-promotion");
+  }
+
+  // Pick the matching stock promotion-panel element for one commander promotion candidate.
+  getCommanderPromotionPanelChoiceElement(panel, candidate = null) {
+    if (!(panel instanceof Element)) {
+      return null;
+    }
+
+    const availableElements = [
+      ...panel.querySelectorAll(
+        ".commendation-element.available, .promotion-element.available",
+      ),
+    ];
+
+    if (availableElements.length <= 0) {
+      return null;
+    }
+
+    if (!candidate) {
+      return availableElements[0] ?? null;
+    }
+
+    const candidateName = candidate.promotion?.Name
+      ? Locale.compose(candidate.promotion.Name)
+      : "";
+
+    for (const element of availableElements) {
+      const promotionId = element.getAttribute("promotion-id") ?? "";
+      const tooltip = element.getAttribute("data-tooltip-content") ?? "";
+
+      if (candidate.promotionType && promotionId === candidate.promotionType) {
+        return element;
+      }
+
+      if (candidateName && tooltip.includes(candidateName)) {
+        return element;
+      }
+    }
+
+    if (candidate.promotion?.Commendation) {
+      return panel.querySelector(".commendation-element.available");
+    }
+
+    return (
+      panel.querySelector(".promotion-element.available") ?? availableElements[0]
+    );
+  }
+
+  // Open the stock commander-promotion interface for the currently selected commander.
+  openCommanderPromotionPanel(unitId) {
+    if (!ComponentID.isValid(unitId)) {
+      return false;
+    }
+
+    this.ensureUnitSelected(unitId);
+
+    if (!this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+      return false;
+    }
+
+    try {
+      InterfaceMode.switchTo("INTERFACEMODE_UNIT_PROMOTION");
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
+  // Drive the stock commander-promotion panel so automation uses the same flow as a manual promotion click.
+  sendCommanderPromotionViaPanel(unitId, candidate, onFailure = null) {
+    if (!ComponentID.isValid(unitId)) {
+      return false;
+    }
+
+    const previousSelectionId = this.getSelectedUnitId();
+    const alreadySelected = this.isSameComponentId(previousSelectionId, unitId);
+
+    if (!alreadySelected) {
+      this.ensureUnitSelected(unitId);
+    }
+
+    if (!this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+      return false;
+    }
+
+    if (!this.openCommanderPromotionPanel(unitId)) {
+      return false;
+    }
+
+    const unitLabel = this.getUnitDisplayName(unitId);
+    const maxAttempts = 24;
+    let attemptCount = 0;
+    const fail = () => {
+      this.restoreTemporaryUnitSelection(
+        unitId,
+        previousSelectionId,
+        alreadySelected,
+      );
+
+      if (typeof onFailure === "function") {
+        onFailure();
+      }
+    };
+
+    const attemptActivation = () => {
+      attemptCount += 1;
+
+      if (!this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+        this.ensureUnitSelected(unitId);
+      }
+
+      if (!this.isSameComponentId(this.getSelectedUnitId(), unitId)) {
+        if (attemptCount < maxAttempts) {
+          setTimeout(attemptActivation, 100);
+          return;
+        }
+
+        console.warn(
+          `Dev panel: could not keep ${unitLabel} selected long enough to open the commander promotion panel.`,
+        );
+        fail();
+        return;
+      }
+
+      const panel = this.getCommanderPromotionPanelElement();
+      const choiceElement = this.getCommanderPromotionPanelChoiceElement(
+        panel,
+        candidate,
+      );
+      const confirmButton = panel?.querySelector("#promotion-confirm-button");
+
+      if (!(choiceElement instanceof Element) || !(confirmButton instanceof Element)) {
+        if (attemptCount % 6 === 0) {
+          this.openCommanderPromotionPanel(unitId);
+        }
+
+        if (attemptCount < maxAttempts) {
+          setTimeout(attemptActivation, 100);
+          return;
+        }
+
+        console.warn(
+          `Dev panel: commander promotion panel never exposed a selectable choice for ${unitLabel}.`,
+        );
+        fail();
+        return;
+      }
+
+      this.activateUiAction(choiceElement);
+
+      if (`${confirmButton.getAttribute("disabled")}` !== "false") {
+        if (attemptCount < maxAttempts) {
+          setTimeout(attemptActivation, 100);
+          return;
+        }
+
+        console.warn(
+          `Dev panel: commander promotion confirm button never enabled for ${unitLabel}.`,
+        );
+        fail();
+        return;
+      }
+
+      requestAnimationFrame(() => {
+        this.activateUiAction(confirmButton);
+
+        requestAnimationFrame(() => {
+          if (InterfaceMode.getCurrent?.() === "INTERFACEMODE_UNIT_PROMOTION") {
+            try {
+              InterfaceMode.switchToDefault();
+            } catch (_error) {
+              // Ignore and leave the stock panel alone if it is mid-update.
+            }
+          }
+
+          this.restoreTemporaryUnitSelection(
+            unitId,
+            previousSelectionId,
+            alreadySelected,
+          );
+        });
+      });
+    };
+
+    setTimeout(attemptActivation, 0);
+    return true;
   }
 
   // Restore the previous unit selection after one delayed stock-command attempt finishes.
@@ -3143,16 +3353,7 @@ export const Actions = new (class {
 
   // Send a single promotion or commendation request to the game core.
   sendCommanderPromotion(unitId, candidate) {
-    const args = {
-      PromotionType: Database.makeHash(candidate.promotionType),
-      PromotionDisciplineType: Database.makeHash(candidate.disciplineType),
-    };
-
-    return this.sendUnitCommand(
-      unitId,
-      this.getCommanderPromoteCommandType(),
-      args,
-    );
+    return this.sendCommanderPromotionViaPanel(unitId, candidate);
   }
 
   // Send a generic commander command such as "upgrade army".
