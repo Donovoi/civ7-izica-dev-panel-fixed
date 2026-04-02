@@ -1300,6 +1300,27 @@ export const Actions = new (class {
     return value ?? fallback;
   }
 
+  // Try several possible native-backed member names until one resolves cleanly.
+  readNativeValueCandidates(target, propertyNames, fallback = null) {
+    if (!target || !Array.isArray(propertyNames)) {
+      return fallback;
+    }
+
+    for (const propertyName of propertyNames) {
+      if (!propertyName) {
+        continue;
+      }
+
+      const value = this.readNativeValue(target, propertyName, undefined);
+
+      if (value !== undefined && value !== null) {
+        return value;
+      }
+    }
+
+    return fallback;
+  }
+
   // Normalize one native-backed numeric member so commander state checks never compare NaN forever.
   readNativeNumber(target, propertyName, fallback = 0) {
     const numericValue = Number(
@@ -1309,9 +1330,23 @@ export const Actions = new (class {
     return Number.isFinite(numericValue) ? numericValue : fallback;
   }
 
+  // Normalize several candidate native-backed numeric members, stopping at the first usable value.
+  readNativeNumberCandidates(target, propertyNames, fallback = 0) {
+    const numericValue = Number(
+      this.readNativeValueCandidates(target, propertyNames, fallback),
+    );
+
+    return Number.isFinite(numericValue) ? numericValue : fallback;
+  }
+
   // Normalize one native-backed boolean member for queue decisions and progress snapshots.
   readNativeBoolean(target, propertyName, fallback = false) {
     return Boolean(this.readNativeValue(target, propertyName, fallback));
+  }
+
+  // Normalize several candidate native-backed boolean members, stopping at the first usable value.
+  readNativeBooleanCandidates(target, propertyNames, fallback = false) {
+    return Boolean(this.readNativeValueCandidates(target, propertyNames, fallback));
   }
 
   // Collect callable method names from a native-backed game component for debugging/fallbacks.
@@ -1434,18 +1469,19 @@ export const Actions = new (class {
   // Build the ordered list of admin actions the current commander can legally try right now.
   getCommanderAdminActions(commander, allowTemporarySelection = false) {
     const buildActions = (resolvedCommander) => {
-      const actions = this.getCommanderPromotionCandidates(resolvedCommander).map(
-        (candidate) => ({
-          kind: "promotion",
-          candidate,
-        }),
-      );
+      const actions = this.getCommanderPromotionCandidates(
+        resolvedCommander,
+        allowTemporarySelection,
+      ).map((candidate) => ({
+        kind: "promotion",
+        candidate,
+      }));
 
       const upgradeArmyResult = this.canStartUnitCommand(
         resolvedCommander.id,
         "UNITCOMMAND_UPGRADE_ARMY",
         this.getDefaultCommandArgs(),
-        false,
+        allowTemporarySelection,
       );
 
       if (upgradeArmyResult?.Success) {
@@ -1496,15 +1532,18 @@ export const Actions = new (class {
     );
 
     return {
-      promotionPoints: this.readNativeNumber(
+      promotionPoints: this.readNativeNumberCandidates(
         experience,
-        "getStoredPromotionPoints",
+        ["getStoredPromotionPoints", "storedPromotionPoints"],
       ),
-      commendationPoints: this.readNativeNumber(
+      commendationPoints: this.readNativeNumberCandidates(
         experience,
-        "getStoredCommendations",
+        ["getStoredCommendations", "storedCommendations"],
       ),
-      canPromote: this.readNativeBoolean(experience, "canPromote"),
+      canPromote: this.readNativeBooleanCandidates(experience, [
+        "canPromote",
+        "getCanPromote",
+      ]),
       promotionSignatures,
     };
   }
@@ -2445,19 +2484,22 @@ export const Actions = new (class {
     const experience = commander?.Experience;
 
     return {
-      level: this.readNativeNumber(experience, "getLevel"),
-      experiencePoints: this.readNativeNumber(experience, "experiencePoints"),
-      experienceToNextLevel: this.readNativeNumber(
+      level: this.readNativeNumberCandidates(experience, ["getLevel", "level"]),
+      experiencePoints: this.readNativeNumberCandidates(experience, [
+        "experiencePoints",
+        "getExperiencePoints",
+      ]),
+      experienceToNextLevel: this.readNativeNumberCandidates(
         experience,
-        "experienceToNextLevel",
+        ["experienceToNextLevel", "getExperienceToNextLevel"],
       ),
-      storedPromotionPoints: this.readNativeNumber(
+      storedPromotionPoints: this.readNativeNumberCandidates(
         experience,
-        "getStoredPromotionPoints",
+        ["getStoredPromotionPoints", "storedPromotionPoints"],
       ),
-      storedCommendations: this.readNativeNumber(
+      storedCommendations: this.readNativeNumberCandidates(
         experience,
-        "getStoredCommendations",
+        ["getStoredCommendations", "storedCommendations"],
       ),
       remainingPromotionCount: this.getCommanderRemainingPromotionCount(
         commander,
@@ -2507,6 +2549,31 @@ export const Actions = new (class {
   // Resolve the stock commander promotion command type, preferring the live enum when it is exposed.
   getCommanderPromoteCommandType() {
     return globalThis.UnitCommandTypes?.PROMOTE ?? "UNITCOMMAND_PROMOTE";
+  }
+
+  // Ask the stock command system whether one specific commander promotion is currently startable.
+  canStartCommanderPromotionCandidate(
+    commander,
+    candidate,
+    allowTemporarySelection = false,
+  ) {
+    if (!commander?.isCommanderUnit || !candidate) {
+      return false;
+    }
+
+    const promotionArgs = {
+      PromotionType: Database.makeHash(candidate.promotionType),
+      PromotionDisciplineType: Database.makeHash(candidate.disciplineType),
+    };
+
+    return Boolean(
+      this.canStartUnitCommand(
+        commander.id,
+        this.getCommanderPromoteCommandType(),
+        promotionArgs,
+        allowTemporarySelection,
+      )?.Success,
+    );
   }
 
   // Resolve the native-backed commander point field name used by one fallback mutation path.
@@ -2718,9 +2785,62 @@ export const Actions = new (class {
       xpAmount,
       initialState,
     );
-    const finalState = this.captureCommanderXpGrantState(
+    let appliedBy = result.appliedBy ?? "none";
+    let diagnostics = result.diagnostics ?? null;
+    let finalState = this.captureCommanderXpGrantState(
       Units.get(commander.id) ?? commander,
     );
+
+    if (!this.hasCommanderXpGrantStateChanged(initialState, finalState)) {
+      const promotionGrant = Math.max(
+        finalState.remainingPromotionCount - finalState.storedPromotionPoints,
+        0,
+      );
+
+      if (promotionGrant > 0) {
+        const promotionResult = this.applyCommanderStoredPointGrant(
+          commander,
+          "promotion",
+          promotionGrant,
+          finalState,
+        );
+
+        if (promotionResult.didChange) {
+          appliedBy = promotionResult.appliedBy ?? appliedBy;
+        }
+
+        diagnostics = promotionResult.diagnostics ?? diagnostics;
+        finalState = this.captureCommanderXpGrantState(
+          Units.get(commander.id) ?? commander,
+        );
+      }
+    }
+
+    if (!this.hasCommanderXpGrantStateChanged(initialState, finalState)) {
+      const commendationGrant = Math.max(
+        finalState.remainingCommendationCount - finalState.storedCommendations,
+        0,
+      );
+
+      if (commendationGrant > 0) {
+        const commendationResult = this.applyCommanderStoredPointGrant(
+          commander,
+          "commendation",
+          commendationGrant,
+          finalState,
+        );
+
+        if (commendationResult.didChange) {
+          appliedBy = commendationResult.appliedBy ?? appliedBy;
+        }
+
+        diagnostics = commendationResult.diagnostics ?? diagnostics;
+        finalState = this.captureCommanderXpGrantState(
+          Units.get(commander.id) ?? commander,
+        );
+      }
+    }
+
     const didChange = this.hasCommanderXpGrantStateChanged(
       initialState,
       finalState,
@@ -2728,14 +2848,18 @@ export const Actions = new (class {
 
     return {
       didChange,
-      reason: didChange ? "xp-granted" : "no-xp-effect",
+      reason: didChange
+        ? result.didChange
+          ? "xp-granted"
+          : "points-granted"
+        : "no-xp-effect",
       initialState,
       finalState,
-      appliedBy: didChange ? result.appliedBy ?? "unknown" : "none",
+      appliedBy: didChange ? appliedBy : "none",
       diagnostics:
         didChange
           ? null
-          : result.diagnostics ??
+          : diagnostics ??
           this.getCommanderExperienceMethodDiagnostics(
             Units.get(commander.id) ?? commander,
           ),
@@ -2834,6 +2958,45 @@ export const Actions = new (class {
       }
     }
 
+    const fieldTargets = [commander?.Experience, commander];
+
+    for (const target of fieldTargets) {
+      if (!target) {
+        continue;
+      }
+
+      let hasExposedField = false;
+
+      try {
+        hasExposedField = stateFieldName in target;
+      } catch (_error) {
+        hasExposedField = false;
+      }
+
+      if (!hasExposedField) {
+        continue;
+      }
+
+      try {
+        target[stateFieldName] = targetValue;
+      } catch (_error) {
+        continue;
+      }
+
+      const afterState = captureAfterState();
+
+      if (!mutationWorked(afterState)) {
+        continue;
+      }
+
+      return {
+        didChange: true,
+        beforeState: initialState,
+        afterState,
+        appliedBy: `${stateFieldName}=`,
+      };
+    }
+
     return {
       didChange: false,
       beforeState: initialState,
@@ -2882,8 +3045,6 @@ export const Actions = new (class {
       return [];
     }
 
-    const promoteCommandType = this.getCommanderPromoteCommandType();
-
     return this.getPromotionMetadataForClass(unitDefinition.PromotionClass).filter(
       (candidate) => {
         if (
@@ -2895,18 +3056,12 @@ export const Actions = new (class {
           return false;
         }
 
-        const promotionArgs = {
-          PromotionType: Database.makeHash(candidate.promotionType),
-          PromotionDisciplineType: Database.makeHash(candidate.disciplineType),
-        };
-
         if (
-          this.canStartUnitCommand(
-            commander.id,
-            promoteCommandType,
-            promotionArgs,
+          this.canStartCommanderPromotionCandidate(
+            commander,
+            candidate,
             allowTemporarySelection,
-          )?.Success
+          )
         ) {
           return true;
         }
@@ -2938,27 +3093,47 @@ export const Actions = new (class {
       return [];
     }
 
-    const storedPromotionPoints = this.readNativeNumber(
-      experience,
-      "getStoredPromotionPoints",
-    );
-    const storedCommendations = this.readNativeNumber(
-      experience,
-      "getStoredCommendations",
+    const potentialCandidates = this.getCommanderPotentialPromotionCandidates(
+      commander,
+      allowTemporarySelection,
     );
 
-    if (storedPromotionPoints <= 0 && storedCommendations <= 0) {
+    if (potentialCandidates.length <= 0) {
       return [];
     }
 
-    return this.getCommanderPotentialPromotionCandidates(
-      commander,
-      allowTemporarySelection,
-    ).filter((candidate) =>
-      candidate.promotion?.Commendation
-        ? storedCommendations > 0
-        : storedPromotionPoints > 0,
+    const storedPromotionPoints = this.readNativeNumberCandidates(
+      experience,
+      ["getStoredPromotionPoints", "storedPromotionPoints"],
     );
+    const storedCommendations = this.readNativeNumberCandidates(
+      experience,
+      ["getStoredCommendations", "storedCommendations"],
+    );
+
+    if (storedPromotionPoints > 0 || storedCommendations > 0) {
+      return potentialCandidates.filter((candidate) =>
+        candidate.promotion?.Commendation
+          ? storedCommendations > 0
+          : storedPromotionPoints > 0,
+      );
+    }
+
+    if (this.readNativeBooleanCandidates(experience, ["canPromote", "getCanPromote"])) {
+      return potentialCandidates
+        .map((candidate) => ({
+          candidate,
+          canStart: this.canStartCommanderPromotionCandidate(
+            commander,
+            candidate,
+            allowTemporarySelection,
+          ),
+        }))
+        .sort((left, right) => Number(right.canStart) - Number(left.canStart))
+        .map((entry) => entry.candidate);
+    }
+
+    return [];
   }
 
   // Choose the next automatic commander admin action, prioritizing promotions and commendations first.
@@ -5469,6 +5644,7 @@ export const Actions = new (class {
     const xpGrantLabel = this.militaryXpGrantAmount.toLocaleString();
     let regularUnitsBoosted = 0;
     let commandersBoosted = 0;
+    let commandersQueuedForPromotion = 0;
     let commandersNoEffect = 0;
     const noEffectCommanderDiagnostics = [];
 
@@ -5480,6 +5656,14 @@ export const Actions = new (class {
         if (result.didChange) {
           commandersBoosted += 1;
         } else {
+          const availableActions = this.getCommanderAdminActions(unit, true);
+
+          if (availableActions.length > 0) {
+            this.enqueueCommanderForAdmin(unit.id);
+            commandersQueuedForPromotion += 1;
+            continue;
+          }
+
           commandersNoEffect += 1;
           noEffectCommanderDiagnostics.push({
             unit,
@@ -5497,8 +5681,12 @@ export const Actions = new (class {
       regularUnitsBoosted += 1;
     }
 
+    if (commandersQueuedForPromotion > 0) {
+      this.scheduleCommanderAdminProcessing();
+    }
+
     console.log(
-      `Dev panel: ${xpGrantLabel} XP applied to ${regularUnitsBoosted} regular unit(s) and ${commandersBoosted} commander(s); ${commandersNoEffect} commander(s) showed no XP change.`,
+      `Dev panel: ${xpGrantLabel} XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersBoosted} commander(s) gained visible XP or points, ${commandersQueuedForPromotion} commander(s) were queued for native promotions, and ${commandersNoEffect} commander(s) showed no XP change.`,
     );
 
     if (commandersNoEffect > 0) {
