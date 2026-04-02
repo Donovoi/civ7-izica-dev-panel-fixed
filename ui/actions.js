@@ -2492,7 +2492,149 @@ export const Actions = new (class {
       xpNeededForNextLevel,
       fallbackXpThreshold,
       paddedFallbackXp,
+      25000,
+      100000,
     ])].filter((value) => Number.isFinite(value) && value > 0);
+  }
+
+  // Return just the interesting native method names that look related to commander XP or promotions.
+  getCommanderExperienceMethodDiagnostics(commander) {
+    const experienceMethods = this.getCallablePropertyNames(
+      commander?.Experience,
+    ).filter((name) => /experience|promotion|commendation|level|xp/i.test(name));
+    const unitMethods = this.getCallablePropertyNames(commander).filter((name) =>
+      /experience|promotion|commendation|level|xp/i.test(name),
+    );
+
+    return {
+      experienceMethods,
+      unitMethods,
+    };
+  }
+
+  // Try the likely commander XP mutation paths until one actually changes the native-backed commander state.
+  applyCommanderExperienceGrant(unitOrId, amount, beforeState = null) {
+    const commander = ComponentID.isValid(unitOrId)
+      ? Units.get(unitOrId)
+      : unitOrId;
+
+    if (!commander?.isCommanderUnit || !Number.isFinite(amount) || amount <= 0) {
+      const fallbackState = commander
+        ? this.captureCommanderXpGrantState(commander)
+        : null;
+
+      return {
+        didChange: false,
+        beforeState: beforeState ?? fallbackState,
+        afterState: fallbackState,
+        appliedBy: "none",
+        diagnostics: commander
+          ? this.getCommanderExperienceMethodDiagnostics(commander)
+          : {
+            experienceMethods: [],
+            unitMethods: [],
+          },
+      };
+    }
+
+    const initialState = beforeState ?? this.captureCommanderXpGrantState(commander);
+    const captureAfterState = () =>
+      this.captureCommanderXpGrantState(Units.get(commander.id) ?? commander);
+    const mutationWorked = (afterState) =>
+      this.hasCommanderXpGrantStateChanged(initialState, afterState) ||
+      this.hasCommanderXpGrantReachedCap(afterState);
+    const tryMutation = (target, methodName, args) => {
+      if (!target || typeof target[methodName] !== "function") {
+        return null;
+      }
+
+      try {
+        target[methodName](...args);
+      } catch (_error) {
+        return null;
+      }
+
+      const afterState = captureAfterState();
+
+      if (!mutationWorked(afterState)) {
+        return null;
+      }
+
+      return {
+        didChange: true,
+        beforeState: initialState,
+        afterState,
+        appliedBy: methodName,
+      };
+    };
+
+    try {
+      Units.changeExperience(commander.id, amount);
+    } catch (_error) {
+      // Ignore and continue into the native-backed fallbacks below.
+    }
+
+    let afterState = captureAfterState();
+
+    if (mutationWorked(afterState)) {
+      return {
+        didChange: true,
+        beforeState: initialState,
+        afterState,
+        appliedBy: "Units.changeExperience",
+      };
+    }
+
+    const methodAttempts = [
+      {
+        target: commander.Experience,
+        methods: [
+          "changeExperience",
+          "addExperience",
+          "grantExperience",
+          "changeExperiencePoints",
+          "addExperiencePoints",
+          "grantExperiencePoints",
+          "addXP",
+          "grantXP",
+        ],
+      },
+      {
+        target: commander,
+        methods: [
+          "changeExperience",
+          "addExperience",
+          "grantExperience",
+          "changeExperiencePoints",
+          "addExperiencePoints",
+          "grantExperiencePoints",
+          "addXP",
+          "grantXP",
+        ],
+      },
+    ];
+
+    for (const attempt of methodAttempts) {
+      for (const methodName of attempt.methods) {
+        const result = tryMutation(attempt.target, methodName, [amount]);
+
+        if (result) {
+          return result;
+        }
+      }
+    }
+
+    afterState = captureAfterState();
+
+    return {
+      didChange: false,
+      beforeState: initialState,
+      afterState,
+      appliedBy: "none",
+      diagnostics: this.getCommanderExperienceMethodDiagnostics(
+        Units.get(commander.id) ?? commander,
+      ),
+    };
   }
 
   // Check whether one commander XP snapshot visibly advanced level-up progress.
@@ -2577,12 +2719,15 @@ export const Actions = new (class {
       }
 
       let afterState = beforeState;
+      let lastGrantResult = null;
 
       for (const xpGrant of this.getCommanderXpGrantAttempts(beforeState)) {
-        Units.changeExperience(liveCommander.id, xpGrant);
-        afterState = this.captureCommanderXpGrantState(
-          Units.get(liveCommander.id) ?? liveCommander,
+        lastGrantResult = this.applyCommanderExperienceGrant(
+          liveCommander,
+          xpGrant,
+          beforeState,
         );
+        afterState = lastGrantResult.afterState ?? beforeState;
 
         if (
           this.hasCommanderXpGrantStateChanged(beforeState, afterState) ||
@@ -2607,11 +2752,24 @@ export const Actions = new (class {
         finalState.storedCommendations !== initialState.storedCommendations ||
         finalState.level !== initialState.level ||
         finalState.experiencePoints !== initialState.experiencePoints,
-      reason: this.hasCommanderXpGrantReachedCap(finalState)
-        ? "capped"
-        : "partial",
+      reason:
+        finalState.experiencePoints === initialState.experiencePoints &&
+          finalState.storedPromotionPoints === initialState.storedPromotionPoints &&
+          finalState.storedCommendations === initialState.storedCommendations
+          ? "no-xp-effect"
+          : this.hasCommanderXpGrantReachedCap(finalState)
+            ? "capped"
+            : "partial",
       initialState,
       finalState,
+      diagnostics:
+        finalState.experiencePoints === initialState.experiencePoints &&
+          finalState.storedPromotionPoints === initialState.storedPromotionPoints &&
+          finalState.storedCommendations === initialState.storedCommendations
+          ? this.getCommanderExperienceMethodDiagnostics(
+            Units.get(commander.id) ?? commander,
+          )
+          : null,
     };
   }
 
@@ -3244,6 +3402,7 @@ export const Actions = new (class {
     const xpState = this.captureCommanderXpGrantState(commander);
     const adminState = this.captureCommanderAdminState(commander);
     const availableActions = this.getCommanderAdminActions(commander, true);
+    const methodDiagnostics = this.getCommanderExperienceMethodDiagnostics(commander);
     const availableActionBlock = availableActions.length > 0
       ? availableActions
         .map(
@@ -3266,6 +3425,8 @@ export const Actions = new (class {
       `Remaining commendations: ${xpState.remainingCommendationCount}`,
       `Promotion/commendation cap reached: ${this.hasCommanderXpGrantReachedCap(xpState) ? "yes" : "no"}`,
       `Native canPromote: ${adminState.canPromote ? "yes" : "no"}`,
+      `Experience methods: ${methodDiagnostics.experienceMethods.join(", ") || "none found"}`,
+      `Unit methods: ${methodDiagnostics.unitMethods.join(", ") || "none found"}`,
       `Detected available actions: ${availableActions.length}`,
       "Available actions:",
       availableActionBlock,
@@ -5173,6 +5334,7 @@ export const Actions = new (class {
     let commandersAlreadyCapped = 0;
     let commandersPartiallyCapped = 0;
     let commandersNoEffect = 0;
+    const noEffectCommanderDiagnostics = [];
 
     // Iterate over a safe unit list so this action does nothing instead of crashing.
     for (const unit of this.getLocalUnits()) {
@@ -5193,6 +5355,11 @@ export const Actions = new (class {
             commandersAlreadyCapped += 1;
           } else {
             commandersNoEffect += 1;
+            noEffectCommanderDiagnostics.push({
+              unit,
+              diagnostics: result.diagnostics,
+              finalState: result.finalState,
+            });
           }
         }
 
@@ -5212,6 +5379,12 @@ export const Actions = new (class {
       console.log(
         `Dev panel: ${commandersNoEffect} commander(s) showed no XP change; inspect one with the commander inspector for raw XP and action details.`,
       );
+
+      noEffectCommanderDiagnostics.slice(0, 3).forEach((entry) => {
+        console.log(
+          `Dev panel: commander XP had no effect on ${this.getUnitDisplayName(entry.unit)} · xp=${entry.finalState?.experiencePoints}/${entry.finalState?.experienceToNextLevel} · storedPromotions=${entry.finalState?.storedPromotionPoints} · storedCommendations=${entry.finalState?.storedCommendations} · experienceMethods=${entry.diagnostics?.experienceMethods?.join(", ") || "none"} · unitMethods=${entry.diagnostics?.unitMethods?.join(", ") || "none"}`,
+        );
+      });
     }
   }
 
