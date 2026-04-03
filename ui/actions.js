@@ -932,6 +932,23 @@ export const Actions = new (class {
     }
   }
 
+  // Best-effort close for the stock commander-promotion interface when automation finds nothing it can click.
+  closeCommanderPromotionPanel() {
+    if (
+      !this.getCommanderPromotionPanelElement() &&
+      InterfaceMode.getCurrent?.() !== "INTERFACEMODE_UNIT_PROMOTION"
+    ) {
+      return false;
+    }
+
+    try {
+      InterfaceMode.switchToDefault();
+      return true;
+    } catch (_error) {
+      return false;
+    }
+  }
+
   // Drive the stock commander-promotion panel so automation uses the same flow as a manual promotion click.
   sendCommanderPromotionViaPanel(unitId, candidate, onFailure = null) {
     if (!ComponentID.isValid(unitId)) {
@@ -957,6 +974,8 @@ export const Actions = new (class {
     const maxAttempts = 24;
     let attemptCount = 0;
     const fail = () => {
+      this.closeCommanderPromotionPanel();
+
       this.restoreTemporaryUnitSelection(
         unitId,
         previousSelectionId,
@@ -3312,6 +3331,18 @@ export const Actions = new (class {
       return [];
     }
 
+    const startableCandidates = potentialCandidates.filter((candidate) =>
+      this.canStartCommanderPromotionCandidate(
+        commander,
+        candidate,
+        allowTemporarySelection,
+      ),
+    );
+
+    if (startableCandidates.length <= 0) {
+      return [];
+    }
+
     const storedPromotionPoints = this.readNativeNumberCandidates(
       experience,
       ["getStoredPromotionPoints", "storedPromotionPoints"],
@@ -3322,7 +3353,7 @@ export const Actions = new (class {
     );
 
     if (storedPromotionPoints > 0 || storedCommendations > 0) {
-      return potentialCandidates.filter((candidate) =>
+      return startableCandidates.filter((candidate) =>
         candidate.promotion?.Commendation
           ? storedCommendations > 0
           : storedPromotionPoints > 0,
@@ -3330,15 +3361,8 @@ export const Actions = new (class {
     }
 
     if (this.readNativeBooleanCandidates(experience, ["canPromote", "getCanPromote"])) {
-      const rankedCandidates = potentialCandidates
-        .map((candidate) => ({
-          candidate,
-          canStart: this.canStartCommanderPromotionCandidate(
-            commander,
-            candidate,
-            allowTemporarySelection,
-          ),
-        }))
+      const rankedCandidates = startableCandidates
+        .map((candidate) => ({ candidate }))
         .sort((left, right) => {
           const commendationWeight =
             Number(left.candidate.promotion?.Commendation) -
@@ -3348,7 +3372,9 @@ export const Actions = new (class {
             return commendationWeight;
           }
 
-          return Number(right.canStart) - Number(left.canStart);
+          return left.candidate.promotionType.localeCompare(
+            right.candidate.promotionType,
+          );
         });
       const regularPromotionCandidates = rankedCandidates.filter(
         (entry) => !entry.candidate.promotion?.Commendation,
@@ -4001,13 +4027,24 @@ export const Actions = new (class {
 
   // Queue every commander that can currently spend promotions, commendations, or formation upgrades.
   upgradeSelectedCommander() {
-    const commanders = this.getCommanderUnits();
+    const allCommanders = this.getCommanderUnits();
 
-    if (commanders.length <= 0) {
+    if (allCommanders.length <= 0) {
       this.manualCommanderUpgradeRequested = false;
       this.resetManualCommanderProgress();
       this.setCommanderStatus("No local commanders found.");
       console.log("Dev panel: no local commanders found.");
+      this.scheduleCommanderStatusReset();
+      return;
+    }
+
+    const commanders = this.getCommandersWithAdminActions();
+
+    if (commanders.length <= 0) {
+      this.manualCommanderUpgradeRequested = false;
+      this.resetManualCommanderProgress();
+      this.setCommanderStatus("No commanders need upgrades right now.");
+      console.log("Dev panel: no commanders need upgrades right now.");
       this.scheduleCommanderStatusReset();
       return;
     }
@@ -4021,7 +4058,9 @@ export const Actions = new (class {
       `Dev panel: scanning ${commanders.length} commander(s) for upgrades.`,
     );
 
-    this.enqueueAllCommandersForAdmin();
+    commanders.forEach((commander) => {
+      this.enqueueCommanderForAdmin(commander.id);
+    });
 
     this.processAdminQueues();
   }
