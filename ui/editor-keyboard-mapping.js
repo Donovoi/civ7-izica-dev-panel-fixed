@@ -6,6 +6,8 @@ const ACTIONS = [
     'reset-panel-size',
     'toggle-fast-gameplay',
     'toggle-performance-profiler',
+    'add-repro-marker',
+    'capture-debug-snapshot',
     'copy-all-logs',
     'clear-all-logs',
     'run-empire-maintenance',

@@ -147,6 +147,9 @@ export const Actions = new (class {
   // Track whether the lightweight frame profiler is currently sampling frame times.
   performanceProfilerEnabled = false;
 
+  // Track how many manual repro markers were dropped in the current UI session.
+  reproMarkerCount = 0;
+
   // Hold the current requestAnimationFrame handle for the profiler loop.
   performanceProfilerFrameHandle = 0;
 
@@ -167,6 +170,17 @@ export const Actions = new (class {
   performanceProfilerMaxSessionCount = 6;
   performanceProfilerMaxEntriesPerSession = 800;
 
+  // Auto-capture a richer debug snapshot when the profiler sees a real hitch, but keep a cooldown so one freeze does not spam forever.
+  performanceProfilerAutoSnapshotEnabled = true;
+  performanceProfilerLastAutoSnapshotAt = 0;
+  performanceProfilerAutoSnapshotCooldownMs = 10000;
+
+  // Remember the player's original infinite-movement state while temporary automation borrows it.
+  temporaryInfiniteMovementOriginalState = null;
+
+  // Track how many active automation flows are currently borrowing infinite movement.
+  temporaryInfiniteMovementBorrowCounts = new Map();
+
   // Track transient retries so commander automation can wait for gamecore without stalling forever.
   commanderAdminRetryCounts = new Map();
 
@@ -182,6 +196,8 @@ export const Actions = new (class {
     "left-increase": "Move the dev panel right.",
     "toggle-fast-gameplay": "Toggle quick combat, quick movement, and notification camera panning for a snappier game flow.",
     "toggle-performance-profiler": "Toggle a lightweight frame-time profiler that reports UI stutters, records resumable session diagnostics, and keeps the console chatty in a helpful way.",
+    "add-repro-marker": "Insert a manual repro marker into the profiler session and mirrored console so copied exports show exactly when you hit the button.",
+    "capture-debug-snapshot": "Capture a one-click debug snapshot with player, selection, commander, queue, progression, and status context into the profiler session and mirrored console.",
     "copy-all-logs": "Copy the current save's profiler session log and the mirrored dev console log to the clipboard so you can paste them into a text file for debugging.",
     "run-empire-maintenance": "Run a one-click empire tune-up: top up economy, growth, happiness, healing, XP, reinforcements, military upgrades, and the full research/civic sweep.",
     "add-gold": "Grant 1,000,000 gold.",
@@ -193,7 +209,7 @@ export const Actions = new (class {
     "spawn-settler": "Spawn a settler at your capital.",
     "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or formation upgrades, including land, naval, and air commanders.",
     "inspect-selected-commander": "Log the selected commander, or the selected unit's commander, including level, stored promotion points, stored commendations, remaining promotions, remaining commendations, and currently detected upgrade actions.",
-    "reinforce-all-units": "Send every eligible land, sea, and air unit to a valid commander.",
+    "reinforce-all-units": "Turn on infinite movement if needed, then send every eligible land, sea, and air unit toward the closest valid commander reinforcement target.",
     "toggle-infinite-movement": "Toggle infinite movement for your units.",
     "upgrade-all-units": "Upgrade every currently eligible local unit and commander in one sweep. Regular units use the stock Upgrade Unit command, while commanders spend promotions, commendations, and army upgrades through the existing commander-admin queue.",
     "heal-units": "Heal every alive player's unit, including packed and traveling units when possible.",
@@ -250,6 +266,8 @@ export const Actions = new (class {
     this.spawnSettler = this.spawnSettler.bind(this);
     this.toggleFastGameplay = this.toggleFastGameplay.bind(this);
     this.togglePerformanceProfiler = this.togglePerformanceProfiler.bind(this);
+    this.addReproMarker = this.addReproMarker.bind(this);
+    this.captureDebugSnapshot = this.captureDebugSnapshot.bind(this);
     this.copyAllLogs = this.copyAllLogs.bind(this);
     this.clearAllLogs = this.clearAllLogs.bind(this);
     this.runEmpireMaintenance = this.runEmpireMaintenance.bind(this);
@@ -321,6 +339,12 @@ export const Actions = new (class {
 
       // Toggle the lightweight frame profiler.
       "toggle-performance-profiler": this.togglePerformanceProfiler,
+
+      // Drop one manual marker into the diagnostics stream for repro notes.
+      "add-repro-marker": this.addReproMarker,
+
+      // Capture one full debug snapshot into the profiler session and mirrored console.
+      "capture-debug-snapshot": this.captureDebugSnapshot,
 
       // Copy the persisted profiler session log plus the mirrored dev console buffer to the clipboard.
       "copy-all-logs": this.copyAllLogs,
@@ -482,6 +506,80 @@ export const Actions = new (class {
     }
 
     return [...unitsByKey.values()];
+  }
+
+  // Read how many active temporary borrows one automation flow currently owns.
+  getTemporaryInfiniteMovementBorrowCount(reason) {
+    return Number(this.temporaryInfiniteMovementBorrowCounts.get(reason) ?? 0);
+  }
+
+  // Borrow infinite movement for one automation flow, preserving the player's original setting until every borrower finishes.
+  borrowTemporaryInfiniteMovement(reason) {
+    const normalizedReason = `${reason ?? ""}`.trim();
+
+    if (!normalizedReason) {
+      return false;
+    }
+
+    if (this.temporaryInfiniteMovementBorrowCounts.size <= 0) {
+      this.temporaryInfiniteMovementOriginalState = InfiniteMovement.isEnabled;
+    }
+
+    this.temporaryInfiniteMovementBorrowCounts.set(
+      normalizedReason,
+      this.getTemporaryInfiniteMovementBorrowCount(normalizedReason) + 1,
+    );
+
+    if (InfiniteMovement.isEnabled) {
+      return false;
+    }
+
+    InfiniteMovement.enable();
+    return true;
+  }
+
+  // Release one temporary infinite-movement borrow and restore the player's original setting once all borrowers are finished.
+  releaseTemporaryInfiniteMovement(reason, completionLabel = reason) {
+    const normalizedReason = `${reason ?? ""}`.trim();
+
+    if (!normalizedReason) {
+      return false;
+    }
+
+    const currentBorrowCount = this.getTemporaryInfiniteMovementBorrowCount(
+      normalizedReason,
+    );
+
+    if (currentBorrowCount <= 0) {
+      return false;
+    }
+
+    if (currentBorrowCount <= 1) {
+      this.temporaryInfiniteMovementBorrowCounts.delete(normalizedReason);
+    } else {
+      this.temporaryInfiniteMovementBorrowCounts.set(
+        normalizedReason,
+        currentBorrowCount - 1,
+      );
+    }
+
+    if (this.temporaryInfiniteMovementBorrowCounts.size > 0) {
+      return false;
+    }
+
+    const originalState = this.temporaryInfiniteMovementOriginalState;
+
+    this.temporaryInfiniteMovementOriginalState = null;
+
+    if (originalState === null || InfiniteMovement.isEnabled === originalState) {
+      return false;
+    }
+
+    InfiniteMovement.setEnabled(originalState);
+    console.log(
+      `Dev panel: restored infinite movement ${originalState ? "on" : "off"} after ${completionLabel}.`,
+    );
+    return true;
   }
 
   // Reset the visible progress state for a manual reinforce-all sweep.
@@ -1956,6 +2054,10 @@ export const Actions = new (class {
       this.manualCommanderUpgradeRequested = false;
       this.resetManualReinforcementProgress();
       this.resetManualCommanderProgress();
+      this.releaseTemporaryInfiniteMovement(
+        "reinforce-all-units",
+        "reinforce-all",
+      );
       this.setCommanderStatus("Commander tasks finished.");
       console.log("Dev panel: commander tasks finished.");
       this.refreshSelectedUnitUI();
@@ -1989,6 +2091,10 @@ export const Actions = new (class {
       }
 
       this.resetManualReinforcementProgress();
+      this.releaseTemporaryInfiniteMovement(
+        "reinforce-all-units",
+        "reinforce-all",
+      );
       this.refreshSelectedUnitUI();
       this.scheduleCommanderStatusReset();
       return;
@@ -2033,6 +2139,10 @@ export const Actions = new (class {
 
     this.manualUnitUpgradeRequested = false;
     this.resetManualUnitUpgradeProgress();
+    this.releaseTemporaryInfiniteMovement(
+      "upgrade-all-units",
+      "upgrade-all military",
+    );
     this.setUnitsStatus(
       `Unit upgrades finished (${upgradedUnits} upgraded, ${skippedUnits} skipped).`,
     );
@@ -2044,7 +2154,7 @@ export const Actions = new (class {
   }
 
   // Return every local non-commander unit that can currently use the stock Upgrade Unit command.
-  getUpgradeableUnits(unitIds = null) {
+  getUpgradeableUnits(unitIds = null, allowTemporarySelection = true) {
     const localPlayerId = this.getLocalPlayerId();
     const candidateUnits = (unitIds ?? this.getLocalUnits().map((unit) => unit.id))
       .map((unitId) => (ComponentID.isValid(unitId) ? Units.get(unitId) : unitId))
@@ -2062,10 +2172,15 @@ export const Actions = new (class {
           unit.id,
           "UNITCOMMAND_UPGRADE",
           this.getDefaultCommandArgs(),
-          true,
+          allowTemporarySelection,
         )?.Success,
       ),
     );
+  }
+
+  // Count upgradeable regular units without borrowing UI selection, so passive diagnostics do not steal focus.
+  getDirectUpgradeableUnitsCount(unitIds = null) {
+    return this.getUpgradeableUnits(unitIds, false).length;
   }
 
   // Mark one queued unit upgrade step as completed and advance visible progress.
@@ -2369,6 +2484,35 @@ export const Actions = new (class {
     return this.reinforcementQueue.length;
   }
 
+  // Build the reinforcement queue and launch the visible manual sweep once movement is already primed.
+  beginManualReinforcementSweep() {
+    const reinforceableUnits = this.replaceReinforcementQueue();
+
+    if (reinforceableUnits <= 0) {
+      this.manualReinforcementRequested = false;
+      this.resetManualReinforcementProgress();
+      this.releaseTemporaryInfiniteMovement(
+        "reinforce-all-units",
+        "reinforce-all",
+      );
+      this.setCommanderStatus("No units can reinforce right now.");
+      console.log("Dev panel: no units can reinforce right now.");
+      this.scheduleCommanderStatusReset();
+      return;
+    }
+
+    this.manualReinforcementRequested = true;
+    this.manualReinforcementTotal = reinforceableUnits;
+    this.manualReinforcementProcessed = 0;
+    this.manualReinforcementSucceeded = 0;
+    this.manualReinforcementSkipped = 0;
+    this.setCommanderStatus(
+      `Reinforcing units… 0 reinforced, 0 skipped, ${reinforceableUnits} left to try`,
+    );
+    console.log(`Dev panel: reinforcing ${reinforceableUnits} available unit(s).`);
+    this.processAdminQueues();
+  }
+
   // Add a single reinforceable unit to the existing queue if it is not already pending.
   enqueueReinforcementUnit(unitId) {
     const action = this.getReinforcementActionForUnit(unitId);
@@ -2506,6 +2650,10 @@ export const Actions = new (class {
       }
 
       this.reinforcementSweepRequested = false;
+      this.releaseTemporaryInfiniteMovement(
+        "reinforce-all-units",
+        "reinforce-all",
+      );
     }
 
     if (!prioritizeCommanders) {
@@ -3987,27 +4135,91 @@ export const Actions = new (class {
     );
   }
 
-  // Queue every currently reinforceable unit and let the engine assign them to valid commanders.
+  // Queue every currently reinforceable unit and let the engine assign them to the closest valid commander target.
   reinforceAllAvailableUnits() {
-    const reinforceableUnits = this.replaceReinforcementQueue();
+    if (this.borrowTemporaryInfiniteMovement("reinforce-all-units")) {
+      this.setCommanderStatus(
+        "Infinite movement enabled; scanning for the closest reinforcement targets…",
+      );
+      console.log(
+        "Dev panel: infinite movement enabled automatically for reinforce-all.",
+      );
 
-    if (reinforceableUnits <= 0) {
-      this.manualReinforcementRequested = false;
-      this.resetManualReinforcementProgress();
-      this.setCommanderStatus("No units can reinforce right now.");
-      console.log("Dev panel: no units can reinforce right now.");
-      this.scheduleCommanderStatusReset();
+      requestAnimationFrame(() => {
+        this.beginManualReinforcementSweep();
+      });
       return;
     }
 
-    this.manualReinforcementRequested = true;
-    this.manualReinforcementTotal = reinforceableUnits;
-    this.manualReinforcementProcessed = 0;
-    this.manualReinforcementSucceeded = 0;
-    this.manualReinforcementSkipped = 0;
-    this.setCommanderStatus(`Reinforcing units… 0 reinforced, 0 skipped, ${reinforceableUnits} left to try`);
-    console.log(`Dev panel: reinforcing ${reinforceableUnits} available unit(s).`);
-    this.processAdminQueues();
+    this.beginManualReinforcementSweep();
+  }
+
+  // Build the manual upgrade-all-military sweep after any temporary movement restore has had a frame to propagate.
+  beginManualMilitaryUpgradeSweep() {
+    const upgradeableUnits = this.getUpgradeableUnits();
+    const upgradeableCommanders = this.getCommandersWithAdminActions();
+
+    if (upgradeableUnits.length <= 0 && upgradeableCommanders.length <= 0) {
+      this.manualUnitUpgradeRequested = false;
+      this.resetManualUnitUpgradeProgress();
+      this.manualCommanderUpgradeRequested = false;
+      this.resetManualCommanderProgress();
+      this.releaseTemporaryInfiniteMovement(
+        "upgrade-all-units",
+        "upgrade-all military",
+      );
+      this.setUnitsStatus("No local units or commanders can upgrade right now.");
+      this.setCommanderStatus("Commanders: ready");
+      console.log("Dev panel: no local units or commanders can upgrade right now.");
+      this.scheduleUnitsStatusReset();
+      return;
+    }
+
+    if (upgradeableCommanders.length > 0) {
+      this.manualCommanderUpgradeRequested = true;
+      this.beginManualCommanderProgress(
+        upgradeableCommanders.map((commander) => commander.id),
+      );
+      this.setCommanderStatus(
+        `Upgrading commanders… 0/${upgradeableCommanders.length} done, ${upgradeableCommanders.length} left, 0 actions sent`,
+      );
+      console.log(
+        `Dev panel: scanning ${upgradeableCommanders.length} commander(s) for upgrades.`,
+      );
+      upgradeableCommanders.forEach((commander) => {
+        this.enqueueCommanderForAdmin(commander.id);
+      });
+      this.processAdminQueues();
+    } else {
+      this.manualCommanderUpgradeRequested = false;
+      this.resetManualCommanderProgress();
+      this.setCommanderStatus("No commanders need upgrades right now.");
+      this.scheduleCommanderStatusReset();
+    }
+
+    if (upgradeableUnits.length > 0) {
+      this.manualUnitUpgradeRequested = true;
+      this.beginManualUnitUpgradeProgress(
+        upgradeableUnits.map((unit) => unit.id),
+      );
+      this.setUnitsStatus(
+        `Upgrading units… 0/${upgradeableUnits.length} upgraded, 0 skipped, ${upgradeableUnits.length} left`,
+      );
+      console.log(
+        `Dev panel: scanning ${upgradeableUnits.length} unit(s) for upgrades.`,
+      );
+      this.scheduleUnitUpgradeProcessing();
+      return;
+    }
+
+    this.releaseTemporaryInfiniteMovement(
+      "upgrade-all-units",
+      "upgrade-all military",
+    );
+    this.manualUnitUpgradeRequested = false;
+    this.resetManualUnitUpgradeProgress();
+    this.setUnitsStatus("No regular units need upgrades right now; upgrading commanders.");
+    this.scheduleUnitsStatusReset(4000);
   }
 
   // Dump the current selected commander state into the mirrored logs for surgical debugging.
@@ -4146,62 +4358,21 @@ export const Actions = new (class {
 
   // Queue every local non-commander unit that can currently use the stock Upgrade Unit command.
   upgradeAllAvailableUnits() {
-    const upgradeableUnits = this.getUpgradeableUnits();
-    const upgradeableCommanders = this.getCommandersWithAdminActions();
-
-    if (upgradeableUnits.length <= 0 && upgradeableCommanders.length <= 0) {
-      this.manualUnitUpgradeRequested = false;
-      this.resetManualUnitUpgradeProgress();
-      this.manualCommanderUpgradeRequested = false;
-      this.resetManualCommanderProgress();
-      this.setUnitsStatus("No local units or commanders can upgrade right now.");
-      this.setCommanderStatus("Commanders: ready");
-      console.log("Dev panel: no local units or commanders can upgrade right now.");
-      this.scheduleUnitsStatusReset();
-      return;
-    }
-
-    if (upgradeableCommanders.length > 0) {
-      this.manualCommanderUpgradeRequested = true;
-      this.beginManualCommanderProgress(
-        upgradeableCommanders.map((commander) => commander.id),
-      );
-      this.setCommanderStatus(
-        `Upgrading commanders… 0/${upgradeableCommanders.length} done, ${upgradeableCommanders.length} left, 0 actions sent`,
-      );
-      console.log(
-        `Dev panel: scanning ${upgradeableCommanders.length} commander(s) for upgrades.`,
-      );
-      upgradeableCommanders.forEach((commander) => {
-        this.enqueueCommanderForAdmin(commander.id);
-      });
-      this.processAdminQueues();
-    } else {
-      this.manualCommanderUpgradeRequested = false;
-      this.resetManualCommanderProgress();
-      this.setCommanderStatus("No commanders need upgrades right now.");
-      this.scheduleCommanderStatusReset();
-    }
-
-    if (upgradeableUnits.length > 0) {
-      this.manualUnitUpgradeRequested = true;
-      this.beginManualUnitUpgradeProgress(
-        upgradeableUnits.map((unit) => unit.id),
-      );
+    if (this.borrowTemporaryInfiniteMovement("upgrade-all-units")) {
       this.setUnitsStatus(
-        `Upgrading units… 0/${upgradeableUnits.length} upgraded, 0 skipped, ${upgradeableUnits.length} left`,
+        "Infinite movement enabled; scanning for military upgrades…",
       );
       console.log(
-        `Dev panel: scanning ${upgradeableUnits.length} unit(s) for upgrades.`,
+        "Dev panel: infinite movement enabled automatically for upgrade-all military.",
       );
-      this.scheduleUnitUpgradeProcessing();
+
+      requestAnimationFrame(() => {
+        this.beginManualMilitaryUpgradeSweep();
+      });
       return;
     }
 
-    this.manualUnitUpgradeRequested = false;
-    this.resetManualUnitUpgradeProgress();
-    this.setUnitsStatus("No regular units need upgrades right now; upgrading commanders.");
-    this.scheduleUnitsStatusReset(4000);
+    this.beginManualMilitaryUpgradeSweep();
   }
 
   // Start a fresh autoplay admin sweep when autoplay begins.
@@ -4448,6 +4619,7 @@ export const Actions = new (class {
     });
 
     this.applyFastGameplaySettings(this.isFastGameplayEnabled());
+    InfiniteMovement.refreshLabel();
     this.updatePerformanceProfilerLabel();
     this.autoplayMasteryEnabled = this.isAutoplayMasteryEnabled();
     this.autoplayMasteryBias = this.getAutoplayMasteryBias();
@@ -4741,6 +4913,199 @@ export const Actions = new (class {
     ].join("\n");
   }
 
+  // Build one manual repro marker line so copied diagnostics clearly show where a test step happened.
+  buildReproMarkerMessage(markerNumber) {
+    const interfaceMode = InterfaceMode.getCurrent?.() ?? "unknown";
+    const autoplayState = Autoplay.isActive
+      ? this.autoplayMasteryEnabled
+        ? `${this.getAutoplayMasteryBiasLabel()} master`
+        : "stock"
+      : "off";
+    const sessionName =
+      this.performanceProfilerSessionName || this.getProfilerSessionMetadata().sessionName;
+
+    return [
+      `Manual repro marker #${markerNumber}`,
+      `session=${sessionName}`,
+      `mode=${interfaceMode}`,
+      `autoplay=${autoplayState}`,
+      `profiler=${this.performanceProfilerEnabled ? "on" : "off"}`,
+      this.describeProfilerContext(),
+    ].join(" · ");
+  }
+
+  // Read one visible status line from the mounted dev panel, falling back when the DOM is unavailable.
+  getStatusText(selector, fallback = "Unavailable") {
+    const text = document.querySelector(selector)?.textContent?.trim();
+
+    return text && text.length > 0 ? text : fallback;
+  }
+
+  // Format one tech/civic branch for the one-click debug snapshot.
+  buildProgressionSnapshotLine(kind, player = this.getLocalPlayer()) {
+    const label = kind === "tech" ? "Tech" : "Civic";
+    const branch = this.getProgressionBranchState(kind, player);
+
+    if (!branch) {
+      return `${label}: unavailable`;
+    }
+
+    if (branch.activeNodeType) {
+      const nodeName = this.getProgressionNodeName(branch.activeNodeType);
+      const turnsLeft = Math.max(Number(branch.manager.getTurnsLeft?.() ?? 0), 0);
+      const repeatableLabel = this.isRepeatableProgressionNode(branch.activeNodeType)
+        ? " (repeatable)"
+        : "";
+
+      return `${label}: ${nodeName}${repeatableLabel}${turnsLeft > 0 ? ` · ${turnsLeft} turns left` : ""}`;
+    }
+
+    const nextNodeType = this.getNextSelectableProgressionNode(branch);
+
+    if (nextNodeType) {
+      return `${label}: none selected · next=${this.getProgressionNodeName(nextNodeType)}`;
+    }
+
+    return `${label}: no selectable nodes`;
+  }
+
+  // Build a one-click debug snapshot with the most useful current runtime context.
+  buildDebugSnapshotReport(trigger = "manual button") {
+    const metadata = this.getProfilerSessionMetadata();
+    const player = this.getLocalPlayer();
+    const selectedUnit = this.getSelectedUnit();
+    const commander = this.getSelectedCommander();
+    const localCities = this.getLocalCities();
+    const localUnits = this.getLocalUnits();
+    const commanders = this.getCommanderUnits();
+    const commanderActions = commander ? this.getCommanderAdminActions(commander) : [];
+    const commanderXpState = commander ? this.captureCommanderXpGrantState(commander) : null;
+    const commanderAdminState = commander ? this.captureCommanderAdminState(commander) : null;
+    const selectedUnitLocation = selectedUnit?.location
+      ? `${selectedUnit.location.x}, ${selectedUnit.location.y}`
+      : "unknown";
+    const autoplayState = Autoplay.isActive
+      ? this.autoplayMasteryEnabled
+        ? `${this.getAutoplayMasteryBiasLabel()} master running`
+        : "stock running"
+      : this.autoplayMasteryEnabled
+        ? `${this.getAutoplayMasteryBiasLabel()} master armed`
+        : "off";
+    const queueReinforcements =
+      this.reinforcementQueue.length + (this.reinforcementInFlight ? 1 : 0);
+    const queueUnitUpgrades =
+      this.unitUpgradeQueue.length + (this.unitUpgradeInFlight ? 1 : 0);
+    const queueCommanderAdmin = this.getPendingCommanderQueueCount();
+    const lines = [
+      "Dev panel: debug snapshot",
+      `Captured: ${new Date().toISOString()}`,
+      `Trigger: ${trigger}`,
+      `Session: ${metadata.sessionName}`,
+      `Player: ${metadata.playerName} (id=${metadata.localPlayerId ?? "unknown"})`,
+      `Leader/Civ: ${metadata.leaderName} / ${metadata.civName}`,
+      `Interface mode: ${InterfaceMode.getCurrent?.() ?? "unknown"}`,
+      `Environment: profiler=${this.performanceProfilerEnabled ? "on" : "off"} · fastGameplay=${this.fastGameplayEnabled ? "on" : "off"} · console=${Console.isVisible() ? "open" : "closed"} · autoplay=${autoplayState}`,
+      `Counts: cities=${localCities.length} · localUnits=${localUnits.length} · commanders=${commanders.length} · commanderActions=${this.getCommandersWithAdminActionsCount()} · reinforceable=${this.getReinforceableUnitsCount()} · directUpgradeable=${this.getDirectUpgradeableUnitsCount()}`,
+      `Queues: commanderAdmin=${queueCommanderAdmin} · reinforcements=${queueReinforcements} · unitUpgrades=${queueUnitUpgrades}`,
+      "Status lines:",
+      `  ${this.getStatusText(".dev-panel-status--performance", this.performanceProfilerEnabled ? "Profiler: sampling frame times…" : this.fastGameplayEnabled ? "Fast gameplay enabled." : "Performance: ready")}`,
+      `  ${this.getStatusText(".dev-panel-status--commanders", "Commanders: ready")}`,
+      `  ${this.getStatusText(".dev-panel-status--units", "Units: ready")}`,
+      `  ${this.getStatusText(".dev-panel-status--progression", "Progression: ready")}`,
+      `  ${this.getStatusText(".dev-panel-status--empire", "Empire: ready")}`,
+      `  ${this.getStatusText(".dev-panel-status--autoplay", this.autoplayMasteryEnabled ? `Autoplay: master mode armed (${this.getAutoplayMasteryBiasLabel()}).` : "Autoplay: stock AI + admin only.")}`,
+      "Selection:",
+      selectedUnit
+        ? `  Unit: ${this.getUnitDisplayName(selectedUnit)} · type=${selectedUnit.type ?? "unknown"} · owner=${selectedUnit.owner ?? "unknown"} · location=${selectedUnitLocation}`
+        : "  Unit: none",
+      commander
+        ? `  Commander: ${this.getUnitDisplayName(commander)} · type=${commander.type ?? "unknown"} · selected=${this.isSameComponentId(selectedUnit?.id, commander.id) ? "yes" : "attached unit"}`
+        : "  Commander: none",
+    ];
+
+    if (commander && commanderXpState && commanderAdminState) {
+      lines.push(
+        `  Commander XP: level=${commanderXpState.level} · xp=${commanderXpState.experiencePoints}/${commanderXpState.experienceToNextLevel} · storedPromotions=${commanderXpState.storedPromotionPoints} · storedCommendations=${commanderXpState.storedCommendations}`,
+        `  Commander nodes: remainingPromotions=${commanderXpState.remainingPromotionCount} · remainingCommendations=${commanderXpState.remainingCommendationCount} · canPromote=${commanderAdminState.canPromote ? "yes" : "no"} · directActions=${commanderActions.length}`,
+      );
+
+      if (commanderActions.length > 0) {
+        lines.push("  Commander actions:");
+
+        commanderActions.slice(0, 5).forEach((action, index) => {
+          lines.push(`    ${index + 1}. ${this.getCommanderAdminActionLabel(action)}`);
+        });
+
+        if (commanderActions.length > 5) {
+          lines.push(`    … ${commanderActions.length - 5} more`);
+        }
+      }
+    }
+
+    lines.push(
+      "Progression:",
+      `  ${this.buildProgressionSnapshotLine("tech", player)}`,
+      `  ${this.buildProgressionSnapshotLine("civic", player)}`,
+      `Profiler context: ${this.describeProfilerContext()}`,
+    );
+
+    return lines.join("\n");
+  }
+
+  // Record one debug snapshot with a caller-provided trigger label and optional status text.
+  recordDebugSnapshot({
+    trigger = "manual button",
+    level = "snapshot",
+    statusMessage = "Debug snapshot captured. Use Copy all logs to export the full report.",
+  } = {}) {
+    const snapshot = this.buildDebugSnapshotReport(trigger);
+
+    this.appendProfilerSessionEntry(level, snapshot);
+    console.log(snapshot);
+    this.setPerformanceStatus(statusMessage);
+    return snapshot;
+  }
+
+  // Drop one manual repro marker into the persisted profiler session and mirrored console log.
+  addReproMarker() {
+    const markerNumber = this.reproMarkerCount + 1;
+    const markerMessage = this.buildReproMarkerMessage(markerNumber);
+
+    this.reproMarkerCount = markerNumber;
+    this.appendProfilerSessionEntry("marker", markerMessage);
+    console.log(`Dev panel: ${markerMessage}`);
+    this.setPerformanceStatus(
+      this.performanceProfilerEnabled
+        ? `Marker #${markerNumber} saved. The profiler export now has a bookmark for this moment.`
+        : `Marker #${markerNumber} saved to the debug export.`,
+    );
+  }
+
+  // Capture one one-click debug snapshot into the profiler session and mirrored console log.
+  captureDebugSnapshot() {
+    this.recordDebugSnapshot();
+  }
+
+  // Auto-capture a richer snapshot when the profiler sees a real hitch, but keep a cooldown so one bad scene does not flood the log.
+  maybeCaptureAutoProfilerSnapshot(frameMs, timestamp) {
+    if (
+      !this.performanceProfilerAutoSnapshotEnabled ||
+      frameMs < 100 ||
+      timestamp - this.performanceProfilerLastAutoSnapshotAt <
+      this.performanceProfilerAutoSnapshotCooldownMs
+    ) {
+      return false;
+    }
+
+    this.performanceProfilerLastAutoSnapshotAt = timestamp;
+    this.recordDebugSnapshot({
+      trigger: `auto hitch ${frameMs.toFixed(1)} ms`,
+      level: "auto-snapshot",
+      statusMessage: `Auto snapshot captured for a ${frameMs.toFixed(1)} ms hitch.`,
+    });
+    return true;
+  }
+
   // Copy the profiler session log plus the mirrored dev console buffer to the clipboard.
   copyAllLogs() {
     const session = this.getActiveProfilerSession();
@@ -4831,6 +5196,10 @@ export const Actions = new (class {
 
     this.appendProfilerSessionEntry(isHitch ? "warn" : "info", message);
     console.log(`Dev panel: ${message}`);
+
+    if (isHitch) {
+      this.maybeCaptureAutoProfilerSnapshot(frameMs, timestamp);
+    }
   }
 
   // Flush the current profiler window into the status text, console, and persistent session log.
@@ -5037,6 +5406,7 @@ export const Actions = new (class {
     this.performanceProfilerFrameHandle = 0;
     this.performanceProfilerLastFrameAt = 0;
     this.performanceProfilerLastOutlierLoggedAt = 0;
+    this.performanceProfilerLastAutoSnapshotAt = 0;
     this.resetPerformanceProfilerWindow();
     this.updatePerformanceProfilerLabel();
     this.setPerformanceStatus(`Profiler: sampling… ${metadata.sessionName}`);
@@ -5088,6 +5458,7 @@ export const Actions = new (class {
     this.performanceProfilerEnabled = false;
     this.performanceProfilerLastFrameAt = 0;
     this.performanceProfilerLastOutlierLoggedAt = 0;
+    this.performanceProfilerLastAutoSnapshotAt = 0;
     this.resetPerformanceProfilerWindow();
     this.updatePerformanceProfilerLabel();
     this.setPerformanceStatus(

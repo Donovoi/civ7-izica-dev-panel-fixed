@@ -9,6 +9,10 @@
             DeviceType="Keyboard" Description="DEVPANEL" />
         <Row ActionId="toggle-performance-profiler" Name="DEVPANEL - Toggle performance profiler"
             DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="add-repro-marker" Name="DEVPANEL - Add repro marker"
+            DeviceType="Keyboard" Description="DEVPANEL" />
+        <Row ActionId="capture-debug-snapshot" Name="DEVPANEL - Capture debug snapshot"
+            DeviceType="Keyboard" Description="DEVPANEL" />
         <Row ActionId="copy-all-logs" Name="DEVPANEL - Copy all logs" DeviceType="Keyboard"
             Description="DEVPANEL" />
         <Row ActionId="clear-all-logs" Name="DEVPANEL - Clear all logs" DeviceType="Keyboard"
@@ -77,6 +81,10 @@
             GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_F" />
         <Row ActionId="toggle-performance-profiler" Index="0" GestureType="KBMouse"
             GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_P" />
+        <Row ActionId="add-repro-marker" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_F3" />
+        <Row ActionId="capture-debug-snapshot" Index="0" GestureType="KBMouse"
+            GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_F4" />
         <Row ActionId="copy-all-logs" Index="0" GestureType="KBMouse"
             GestureData="KEY_LCONTROL+KEY_LSHIFT+KEY_L" />
         <Row ActionId="clear-all-logs" Index="0" GestureType="KBMouse"
