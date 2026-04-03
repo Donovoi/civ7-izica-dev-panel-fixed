@@ -4097,7 +4097,7 @@ export const Actions = new (class {
     this.completeProduction();
     this.addPopulation();
     this.healUnits();
-    this.addXp({ queueCommandersForPromotion: false });
+    this.addXp();
     this.reinforceAllAvailableUnits();
     this.upgradeAllAvailableUnits();
     this.completeAllResearchAndCivics();
@@ -5976,15 +5976,30 @@ export const Actions = new (class {
     }
   }
 
-  addXp(options = {}) {
-    const queueCommandersForPromotion =
-      options?.queueCommandersForPromotion === true;
+  addXp() {
     const xpGrantLabel = this.militaryXpGrantAmount.toLocaleString();
     let regularUnitsBoosted = 0;
     let commandersBoosted = 0;
-    let commandersQueuedForPromotion = 0;
     let commandersNoEffect = 0;
     const noEffectCommanderDiagnostics = [];
+
+    // The manual XP button should only grant XP; if some stale commander automation is still hanging around,
+    // cancel it before the XP pass so the action does not start selecting commanders on its own.
+    if (
+      !Autoplay.isActive &&
+      !this.manualCommanderUpgradeRequested &&
+      !this.manualReinforcementRequested &&
+      !this.reinforcementSweepRequested &&
+      (this.commanderAdminQueue.length > 0 || this.commanderAdminInFlight)
+    ) {
+      this.commanderAdminQueue = [];
+      this.commanderAdminInFlight = null;
+      this.commanderAdminRetryCounts.clear();
+      this.manualCommanderCurrentName = "";
+      this.closeCommanderPromotionPanel();
+      this.setCommanderStatus("Commanders: ready");
+      console.log("Dev panel: cleared stray commander automation before granting XP.");
+    }
 
     // Iterate over a safe unit list so this action does nothing instead of crashing.
     for (const unit of this.getLocalUnits()) {
@@ -5994,16 +6009,6 @@ export const Actions = new (class {
         if (result.didChange) {
           commandersBoosted += 1;
         } else {
-          if (queueCommandersForPromotion) {
-            const availableActions = this.getCommanderAdminActions(unit, true);
-
-            if (availableActions.length > 0) {
-              this.enqueueCommanderForAdmin(unit.id);
-              commandersQueuedForPromotion += 1;
-              continue;
-            }
-          }
-
           commandersNoEffect += 1;
           noEffectCommanderDiagnostics.push({
             unit,
@@ -6021,12 +6026,8 @@ export const Actions = new (class {
       regularUnitsBoosted += 1;
     }
 
-    if (queueCommandersForPromotion && commandersQueuedForPromotion > 0) {
-      this.scheduleCommanderAdminProcessing();
-    }
-
     console.log(
-      `Dev panel: ${xpGrantLabel} XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersBoosted} commander(s) gained visible XP or points, ${commandersQueuedForPromotion} commander(s) were queued for native promotions, and ${commandersNoEffect} commander(s) showed no XP change.`,
+      `Dev panel: ${xpGrantLabel} XP applied to ${regularUnitsBoosted} regular unit(s); ${commandersBoosted} commander(s) gained visible XP or points, and ${commandersNoEffect} commander(s) showed no XP change.`,
     );
 
     if (commandersNoEffect > 0) {
