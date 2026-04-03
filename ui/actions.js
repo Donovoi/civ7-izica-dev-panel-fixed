@@ -2780,6 +2780,18 @@ export const Actions = new (class {
     return globalThis.UnitCommandTypes?.PROMOTE ?? "UNITCOMMAND_PROMOTE";
   }
 
+  // Build the stock command payload for one commander promotion or commendation.
+  getCommanderPromotionArgs(candidate) {
+    if (!candidate?.promotionType || !candidate?.disciplineType) {
+      return null;
+    }
+
+    return {
+      PromotionType: Database.makeHash(candidate.promotionType),
+      PromotionDisciplineType: Database.makeHash(candidate.disciplineType),
+    };
+  }
+
   // Ask the stock command system whether one specific commander promotion is currently startable.
   canStartCommanderPromotionCandidate(
     commander,
@@ -2790,10 +2802,11 @@ export const Actions = new (class {
       return false;
     }
 
-    const promotionArgs = {
-      PromotionType: Database.makeHash(candidate.promotionType),
-      PromotionDisciplineType: Database.makeHash(candidate.disciplineType),
-    };
+    const promotionArgs = this.getCommanderPromotionArgs(candidate);
+
+    if (!promotionArgs) {
+      return false;
+    }
 
     return Boolean(
       this.canStartUnitCommand(
@@ -3394,9 +3407,35 @@ export const Actions = new (class {
     return this.getCommanderAdminActions(commander, allowTemporarySelection)[0] ?? null;
   }
 
-  // Send a single promotion or commendation request to the game core.
-  sendCommanderPromotion(unitId, candidate) {
-    return this.sendCommanderPromotionViaPanel(unitId, candidate);
+  // Send a single promotion or commendation request to the game core, preferring the direct command path.
+  sendCommanderPromotion(unitId, candidate, onFailure = null) {
+    const promotionArgs = this.getCommanderPromotionArgs(candidate);
+    const fallbackToPanel = () => {
+      if (this.sendCommanderPromotionViaPanel(unitId, candidate, onFailure)) {
+        return;
+      }
+
+      if (typeof onFailure === "function") {
+        onFailure();
+      }
+    };
+
+    if (!promotionArgs) {
+      return this.sendCommanderPromotionViaPanel(unitId, candidate, onFailure);
+    }
+
+    if (
+      this.sendUnitCommand(
+        unitId,
+        this.getCommanderPromoteCommandType(),
+        promotionArgs,
+        fallbackToPanel,
+      )
+    ) {
+      return true;
+    }
+
+    return this.sendCommanderPromotionViaPanel(unitId, candidate, onFailure);
   }
 
   // Send a generic commander command such as "upgrade army".
@@ -3441,6 +3480,42 @@ export const Actions = new (class {
 
       for (const nextAction of availableActions) {
         const token = ++this.commanderAdminActionSequence;
+        const handleCommanderActionFailure = () => {
+          if (
+            !this.isSameComponentId(this.commanderAdminInFlight?.unitId, commander.id) &&
+            !this.isSameComponentId(this.commanderAdminQueue[0], commander.id)
+          ) {
+            return;
+          }
+
+          this.commanderAdminInFlight = null;
+          this.closeCommanderPromotionPanel();
+
+          const retryCount = this.incrementCommanderRetryCount(commander.id);
+
+          if (retryCount <= 5) {
+            if (retryCount === 1 || retryCount === 3 || retryCount === 5) {
+              console.warn(
+                `Dev panel: retrying commander ${this.getUnitDisplayName(commander)} after ${this.getCommanderAdminActionLabel(nextAction)} failed to start (${retryCount}).`,
+              );
+            }
+
+            this.scheduleCommanderAdminProcessing();
+            return;
+          }
+
+          console.warn(
+            `Dev panel: dropping commander ${this.getUnitDisplayName(commander)} after repeated failed ${this.getCommanderAdminActionLabel(nextAction)} attempts.`,
+          );
+
+          if (this.isSameComponentId(this.commanderAdminQueue[0], commander.id)) {
+            this.commanderAdminQueue.shift();
+          }
+
+          this.resetCommanderRetryCount(commander.id);
+          this.markManualCommanderComplete(commander.id);
+          this.scheduleCommanderAdminProcessing();
+        };
 
         this.commanderAdminInFlight = {
           kind: nextAction.kind,
@@ -3453,7 +3528,11 @@ export const Actions = new (class {
 
         const didStart =
           nextAction.kind === "promotion"
-            ? this.sendCommanderPromotion(commander.id, nextAction.candidate)
+            ? this.sendCommanderPromotion(
+              commander.id,
+              nextAction.candidate,
+              handleCommanderActionFailure,
+            )
             : this.sendCommanderCommand(commander.id, nextAction.commandType);
 
         if (didStart) {
@@ -4018,7 +4097,7 @@ export const Actions = new (class {
     this.completeProduction();
     this.addPopulation();
     this.healUnits();
-    this.addXp();
+    this.addXp({ queueCommandersForPromotion: false });
     this.reinforceAllAvailableUnits();
     this.upgradeAllAvailableUnits();
     this.completeAllResearchAndCivics();
@@ -5897,7 +5976,9 @@ export const Actions = new (class {
     }
   }
 
-  addXp() {
+  addXp(options = {}) {
+    const queueCommandersForPromotion =
+      options?.queueCommandersForPromotion !== false;
     const xpGrantLabel = this.militaryXpGrantAmount.toLocaleString();
     let regularUnitsBoosted = 0;
     let commandersBoosted = 0;
@@ -5913,12 +5994,14 @@ export const Actions = new (class {
         if (result.didChange) {
           commandersBoosted += 1;
         } else {
-          const availableActions = this.getCommanderAdminActions(unit, true);
+          if (queueCommandersForPromotion) {
+            const availableActions = this.getCommanderAdminActions(unit, true);
 
-          if (availableActions.length > 0) {
-            this.enqueueCommanderForAdmin(unit.id);
-            commandersQueuedForPromotion += 1;
-            continue;
+            if (availableActions.length > 0) {
+              this.enqueueCommanderForAdmin(unit.id);
+              commandersQueuedForPromotion += 1;
+              continue;
+            }
           }
 
           commandersNoEffect += 1;
@@ -5938,7 +6021,7 @@ export const Actions = new (class {
       regularUnitsBoosted += 1;
     }
 
-    if (commandersQueuedForPromotion > 0) {
+    if (queueCommandersForPromotion && commandersQueuedForPromotion > 0) {
       this.scheduleCommanderAdminProcessing();
     }
 
