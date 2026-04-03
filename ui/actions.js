@@ -5978,7 +5978,7 @@ export const Actions = new (class {
 
   addXp(options = {}) {
     const queueCommandersForPromotion =
-      options?.queueCommandersForPromotion !== false;
+      options?.queueCommandersForPromotion === true;
     const xpGrantLabel = this.militaryXpGrantAmount.toLocaleString();
     let regularUnitsBoosted = 0;
     let commandersBoosted = 0;
