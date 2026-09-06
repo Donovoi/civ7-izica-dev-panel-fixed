@@ -27,6 +27,9 @@ const component = (id,owner=0) => ({id,owner,type:0});
 const equalId = (a,b) => !!a && !!b && a.id === b.id && a.owner === b.owner && a.type === b.type;
 const hash = text => { let n=2166136261; for(const c of text)n=Math.imul(n ^ c.charCodeAt(0),16777619); return n >>> 0; };
 const PROMOTE = 73001;
+const NATIVE_COMMANDER_TYPE = -1404681544;
+// Freeze the source for one test run so parallel edits cannot mix revisions.
+const actionsSource = fs.readFileSync(new URL('../ui/actions.js',import.meta.url),'utf8');
 const definitions = [
     {type:'PROMOTION_A_1',discipline:'DISCIPLINE_A'},
     {type:'PROMOTION_A_2',discipline:'DISCIPLINE_A',prerequisite:'PROMOTION_A_1'},
@@ -37,10 +40,33 @@ const definitions = [
 ];
 
 async function integration(options={}) {
-    const clock=new Clock(), listeners=new Map(), units=[], requests=[], grants=[], statuses=[], logs=[], eligibilityCalls=[];
+    const clock=new Clock(), listeners=new Map(), units=[], requests=[], grants=[], statuses=[], logs=[], eligibilityCalls=[], damageChanges=[], invalidUnitLookups=[];
+    const unitDefinitions=new Map([
+        ...['LAND','SEA','AIR'].map(domain=>['COMMANDER_'+domain,{UnitType:'COMMANDER_'+domain,PromotionClass:'CLASS_COMMANDER',CoreClass:'CORE_CLASS_SUPPORT',Domain:domain}]),
+        [NATIVE_COMMANDER_TYPE,{UnitType:'COMMANDER_LAND',PromotionClass:'CLASS_COMMANDER',CoreClass:'CORE_CLASS_SUPPORT',Domain:'LAND'}],
+        ...['SOLDIER','SOLDIER_UPGRADED'].map(type=>[type,{UnitType:type,CoreClass:'CORE_CLASS_MILITARY',Domain:'LAND'}]),
+    ]);
+    const allClassSets=['DISCIPLINE_A','DISCIPLINE_B'].map(d=>({PromotionClassType:'CLASS_COMMANDER',UnitPromotionDisciplineType:d}));
+    const allDetails=definitions.map(d=>({UnitPromotionDisciplineType:d.discipline,UnitPromotionType:d.type,PrereqUnitPromotion:d.prerequisite}));
+    const allPromotions=definitions.map((d,i)=>({UnitPromotionType:d.type,Name:d.type,Commendation:!!d.commendation,$hash:hash(d.type),$index:i}));
+    const metadata={classSets:[...allClassSets],details:[...allDetails],promotions:[...allPromotions]};
+    metadata.promotions.lookup=value=>metadata.promotions.find(row=>row.UnitPromotionType===value||row.$hash===value||row.$index===value);
+    const setMetadata=({classSets,details,promotions}={})=>{
+        if(classSets)metadata.classSets.splice(0,metadata.classSets.length,...classSets);
+        if(details)metadata.details.splice(0,metadata.details.length,...details);
+        if(promotions)metadata.promotions.splice(0,metadata.promotions.length,...promotions);
+    };
+    const restoreMetadata=()=>setMetadata({classSets:allClassSets,details:allDetails,promotions:allPromotions});
     let selected=null, selectedAt=-100, focused=null, interfaceMode='INTERFACEMODE_DEFAULT';
     const emit=(name,data)=>{ for(const fn of listeners.get(name)??[])fn(data); };
     const find=id=>units.find(u=>equalId(u.id,id));
+    const nativeGet=value=>{
+        if(value==null)return undefined;
+        if(!Number.isInteger(value.id)||!Number.isInteger(value.owner)||!Number.isInteger(value.type)){
+            invalidUnitLookups.push(value);throw new TypeError('Units.get requires a numeric ComponentID; got a nested unit object or malformed ID');
+        }
+        return find(value);
+    };
     const canEarn=(u,discipline,type,excludeCost)=>{
         eligibilityCalls.push({discipline,type,excludeCost});
         assert.equal(typeof discipline,'string','native Experience requires discipline type strings');
@@ -60,6 +86,7 @@ async function integration(options={}) {
             get getStoredPromotionPoints(){return u.xp.points;},
             get getStoredCommendations(){return u.xp.commendations;},
             get getLevel(){return u.xp.level;},
+            get getTotalPromotionsEarned(){return u.xp.owned.size;},
             get experiencePoints(){return u.xp.experience;},
             get experienceToNextLevel(){return 10;},
             hasPromotion:(discipline,type)=>{assert.equal(typeof discipline,'string');assert.equal(typeof type,'string');return u.xp.owned.has(type);},
@@ -69,7 +96,7 @@ async function integration(options={}) {
     };
     const addSoldier=(n,extra={})=>{const u={id:component(n,extra.owner??0),owner:extra.owner??0,type:'SOLDIER',name:'Soldier '+n,isCommanderUnit:false,isOnMap:true,
         location:{x:n,y:0},Movement:{movementMovesRemaining:2,maxMoves:2},upgradeable:true,...extra};units.push(u);return u;};
-    const commander=addCommander(10,options.points??3);
+    const commander=addCommander(10,options.points??3,{type:options.commanderType??'COMMANDER_LAND'});
     if(options.selected) {selected=commander.id;if(options.focused)focused=commander.id;}
     const canStart=(id,command,args)=>{
         const u=find(id); if(!u || u.owner!==g.GameContext.localPlayerID)return {Success:false};
@@ -107,13 +134,12 @@ async function integration(options={}) {
     class Element {dispatchEvent(){return true;}focus(){}}
     const panel=new Element();
     const g={GameContext:{localPlayerID:0},Players:{get:id=>id===0?player:null},
-        Units:{get:find,restoreMovement:id=>{const u=find(id);if(u)u.Movement.movementMovesRemaining=u.Movement.maxMoves;},
+        Units:{get:nativeGet,restoreMovement:id=>{const u=nativeGet(id);if(u)u.Movement.movementMovesRemaining=u.Movement.maxMoves;},
+            setDamage:(id,amount)=>{assert(nativeGet(id),'setDamage received a missing unit');damageChanges.push({id,amount});},
             changeExperience:(id,amount)=>{grants.push({id,amount});const apply=()=>{const u=find(id);if(u?.isCommanderUnit){u.xp.points+=options.xpPoints??2;u.xp.level++;u.xp.experience+=amount;emit('UnitExperienceChanged',{unit:id});}};
                 if(options.xpInline)apply();else clock.schedule(apply,options.xpDelay??500);}},
-        GameInfo:{Units:{lookup:type=>type.startsWith('COMMANDER')?{PromotionClass:'CLASS_COMMANDER',CoreClass:'CORE_CLASS_SUPPORT',Domain:type.includes('SEA')?'SEA':type.includes('AIR')?'AIR':'LAND'}:{CoreClass:'CORE_CLASS_MILITARY',Domain:'LAND'}},
-            UnitPromotionClassSets:['DISCIPLINE_A','DISCIPLINE_B'].map(d=>({PromotionClassType:'CLASS_COMMANDER',UnitPromotionDisciplineType:d})),
-            UnitPromotionDisciplineDetails:definitions.map(d=>({UnitPromotionDisciplineType:d.discipline,UnitPromotionType:d.type,PrereqUnitPromotion:d.prerequisite})),
-            UnitPromotions:{lookup:type=>{const d=definitions.find(d=>d.type===type);return d?{Name:d.type,Commendation:!!d.commendation}:null;}}},
+        GameInfo:{Units:{lookup:type=>unitDefinitions.get(type)},
+            UnitPromotionClassSets:metadata.classSets,UnitPromotionDisciplineDetails:metadata.details,UnitPromotions:metadata.promotions},
         Database:{makeHash:hash},UnitCommandTypes:{PROMOTE},Game:{UnitCommands:{canStart,sendRequest}},
         UI:{Player:{getHeadSelectedUnit:()=>selected,selectUnit:id=>{if(!equalId(selected,id)){selected=id;selectedAt=clock.time;focused=null;}},deselectAllUnits:()=>{selected=null;focused=null;}}},
         Locale:{compose:text=>text},Element,HTMLElement:Element,Event:class {constructor(type){this.type=type;}},
@@ -129,7 +155,9 @@ async function integration(options={}) {
         '/core/ui/context-manager/context-manager.js':{default:{}},
         '/core/ui-next/services/focus-manager.js':{FocusManager:{get:()=>({setFocus:element=>{assert.equal(element,panel);focused=selected;}})}},
         '/core/ui/interface-modes/interface-modes.js':{InterfaceMode:{switchTo:mode=>{interfaceMode=mode;},getCurrent:()=>interfaceMode,switchToDefault:()=>{interfaceMode='INTERFACEMODE_DEFAULT';}}},
-        '/core/ui/utilities/utilities-component-id.js':{ComponentID:{isValid:id=>Number.isInteger(id?.id)&&id.id>=0&&Number.isInteger(id?.owner),isMatch:equalId}},
+        // The stock helper checks sentinel values, not numeric shape. A unit
+        // object therefore passes isValid even though Units.get rejects it.
+        '/core/ui/utilities/utilities-component-id.js':{ComponentID:{isValid:id=>id!=null&&id.owner!=-1&&id.id!=-1,isMatch:equalId}},
         './storage.js':{Storage:{get:()=>null,set(){}}},'./console.js':{Console:{}},'./logs.js':{Logs:{}},
         './attribute-spending.js':{AttributeSpending:{}},'./building-automation.js':{BuildingAutomation:{}},
         './city-growth.js':{CityGrowth:{start(){},toggle(){},refreshStatus(){}}},
@@ -139,7 +167,7 @@ async function integration(options={}) {
         if(cache.has(name))return cache.get(name);
         let module;
         if(stubs[name]){const values=stubs[name];module=new vm.SyntheticModule(Object.keys(values),function(){for(const [key,value]of Object.entries(values))this.setExport(key,value);},{context});}
-        else module=new vm.SourceTextModule(fs.readFileSync(new URL('../ui/'+name.replace('./',''),import.meta.url),'utf8'),{context,identifier:name});
+        else module=new vm.SourceTextModule(name==='./actions.js'?actionsSource:fs.readFileSync(new URL('../ui/'+name.replace('./',''),import.meta.url),'utf8'),{context,identifier:name});
         cache.set(name,module);await module.link(load);return module;
     }
     const module=await load('./actions.js');await module.evaluate();const actions=module.namespace.Actions;
@@ -154,7 +182,8 @@ async function integration(options={}) {
     const movement=cache.get('./infinite-movement.js').namespace.InfiniteMovement;
     const upgrade=()=>actions.map['upgrade-all-units']();
     const empire=()=>actions.map['run-empire-maintenance']();
-    return {actions,g,clock,commander,units,addCommander,addSoldier,requests,grants,statuses,logs,emit,eligibilityCalls,movement,upgrade,empire};
+    return {actions,g,clock,commander,units,addCommander,addSoldier,requests,grants,statuses,logs,emit,eligibilityCalls,movement,upgrade,empire,
+        metadata,setMetadata,restoreMetadata,unitDefinitions,damageChanges,invalidUnitLookups};
 }
 const tests=[];
 async function test(name,fn){try{await fn();tests.push({name,passed:true});}catch(error){tests.push({name,passed:false,error:error.stack});}}
@@ -264,6 +293,99 @@ await test('Removing a commander during an unconfirmed request does not block th
 });
 await test('An existing infinite movement preference remains enabled after all promotions drain',async()=>{
     const s=await integration();s.movement.enable();s.upgrade();s.clock.drain();assert.equal(s.commander.xp.points,0);assert.equal(s.movement.isEnabled,true);idle(s);
+});
+await test('Numeric native commander unit types resolve their promotion class and spend points',async()=>{
+    const s=await integration({commanderType:NATIVE_COMMANDER_TYPE,requireFocus:true});s.upgrade();s.clock.drain();
+    assert.equal(s.commander.type,NATIVE_COMMANDER_TYPE);assert.equal(s.commander.xp.points,0);assert.equal(promotions(s).length,3);idle(s);
+});
+await test('An initially empty promotion class table is refreshed after native data appears',async()=>{
+    const s=await integration();s.setMetadata({classSets:[]});assert.equal(s.actions.getPromotionMetadataForClass('CLASS_COMMANDER').length,0);
+    s.restoreMetadata();s.upgrade();s.clock.drain();assert.equal(s.commander.xp.points,0);assert.equal(promotions(s).length,3);idle(s);
+});
+await test('Initially empty discipline details do not permanently cache an empty tree',async()=>{
+    const s=await integration();s.setMetadata({details:[]});assert.equal(s.actions.getPromotionMetadataForClass('CLASS_COMMANDER').length,0);
+    s.restoreMetadata();s.upgrade();s.clock.drain();assert.equal(s.commander.xp.points,0);assert.equal(promotions(s).length,3);idle(s);
+});
+await test('Temporarily unavailable promotion definitions recover after native lookups hydrate',async()=>{
+    const s=await integration();s.setMetadata({promotions:[]});assert.equal(s.actions.getPromotionMetadataForClass('CLASS_COMMANDER').length,0);
+    s.restoreMetadata();s.upgrade();s.clock.drain();assert.equal(s.commander.xp.points,0);assert.equal(promotions(s).length,3);idle(s);
+});
+await test('Partially loaded promotion definitions expand when the remaining nodes become available',async()=>{
+    const s=await integration();s.setMetadata({promotions:s.metadata.promotions.filter(row=>row.UnitPromotionType==='PROMOTION_A_1')});
+    assert.equal(s.actions.getPromotionMetadataForClass('CLASS_COMMANDER').length,1);s.restoreMetadata();
+    assert.equal(s.actions.getPromotionMetadataForClass('CLASS_COMMANDER').length,definitions.length);s.upgrade();s.clock.drain();assert.equal(s.commander.xp.points,0);idle(s);
+});
+await test('A later military sweep sees discipline nodes that were missing during the previous sweep',async()=>{
+    const s=await integration({points:2});s.setMetadata({details:s.metadata.details.filter(row=>row.UnitPromotionType==='PROMOTION_A_1')});s.upgrade();s.clock.drain();
+    assert.equal(s.commander.xp.points,1);assert.equal(promotions(s).length,1);s.restoreMetadata();s.upgrade();s.clock.drain();
+    assert.equal(s.commander.xp.points,0);assert.equal(promotions(s).length,2);idle(s);
+});
+await test('An owned partial tree remains queued until its missing native definitions hydrate',async()=>{
+    const s=await integration({points:1});s.commander.xp.owned.add('PROMOTION_A_1');
+    s.setMetadata({promotions:s.metadata.promotions.filter(row=>row.UnitPromotionType==='PROMOTION_A_1')});
+    s.clock.schedule(()=>s.restoreMetadata(),500);s.upgrade();s.clock.drain();
+    assert.equal(s.commander.xp.points,0);assert.equal(promotions(s).length,1);assert(promotions(s)[0].at>=500);idle(s);
+});
+await test('Missing metadata with banked points terminates with an unknown-tree diagnostic',async()=>{
+    const s=await integration({points:27,selected:true,commanderType:NATIVE_COMMANDER_TYPE});s.commander.xp.level=57;s.setMetadata({classSets:[]});
+    s.actions.map['inspect-selected-commander']();s.upgrade();s.clock.drain();assert.equal(promotions(s).length,0);assert.equal(s.commander.xp.points,27);
+    const text=[...s.logs,...s.statuses.map(x=>x.text)].join('\n');assert.match(text,/metadata.*(?:unavailable|unknown|missing|incomplete)|(?:unavailable|unknown|missing|incomplete).*metadata/i);
+    assert(!s.logs.some(line=>/Commander 10 finished upgrading\./.test(line)));assert(!s.statuses.some(x=>/Commander upgrades finished|No local units or commanders can upgrade|No commanders need upgrades/i.test(x.text)));failedStatus(s);idle(s);
+});
+await test('Missing native unit definitions are distinguished from a fully purchased promotion tree',async()=>{
+    const s=await integration({points:3,selected:true,commanderType:NATIVE_COMMANDER_TYPE});s.unitDefinitions.delete(NATIVE_COMMANDER_TYPE);
+    s.actions.map['inspect-selected-commander']();s.upgrade();s.clock.drain();assert.equal(promotions(s).length,0);assert.equal(s.commander.xp.points,3);
+    assert.match([...s.logs,...s.statuses.map(x=>x.text)].join('\n'),/unavailable|unknown|missing|incomplete/i);failedStatus(s);idle(s);
+});
+await test('A fully purchased native tree with surplus points sends no request and reports all nodes owned',async()=>{
+    const s=await integration({points:27,selected:true,commanderType:NATIVE_COMMANDER_TYPE});s.commander.xp.level=57;s.commander.xp.owned=new Set(definitions.map(d=>d.type));
+    s.actions.map['inspect-selected-commander']();s.upgrade();s.clock.drain();assert.equal(promotions(s).length,0);assert.equal(s.commander.xp.points,27);
+    const text=[...s.logs,...s.statuses.map(x=>x.text)].join('\n');assert.match(text,/all[^\n]*(?:owned|purchased)|fully[^\n]*(?:purchased|promoted)|tree[^\n]*complete/i);
+    const diagnostic=s.actions.getCommanderPromotionDiagnostics(s.commander);assert.equal(diagnostic.metadataAvailable,true);assert.equal(diagnostic.totalNodes,definitions.length);
+    assert.equal(diagnostic.ownedRegular,5);assert.equal(diagnostic.ownedCommendations,1);assert.equal(diagnostic.unownedNodes,0);assert.equal(diagnostic.nativePromotionsEarned,definitions.length);idle(s);
+});
+await test('Autoplay mastery accepts a real commander object without passing it into Units.get',async()=>{
+    const s=await integration({points:0,xpInline:true});assert.equal(s.actions.boostUnitForAutoplayMastery(s.commander),true);
+    assert.equal(s.grants.length,1);assert(equalId(s.grants[0].id,s.commander.id));assert.equal(s.damageChanges.length,1);
+    assert.equal(s.commander.xp.points,2);assert.equal(s.invalidUnitLookups.length,0);assert(s.actions.hasQueuedCommander(s.commander.id));
+});
+await test('Autoplay mastery accepts numeric ComponentIDs and regular unit objects',async()=>{
+    const s=await integration({points:0,xpInline:true});const soldier=s.addSoldier(1);
+    assert.equal(s.actions.boostUnitForAutoplayMastery(s.commander.id),true);assert.equal(s.actions.boostUnitForAutoplayMastery(soldier),true);
+    assert.equal(s.grants.length,2);assert.equal(s.damageChanges.length,2);assert.equal(s.invalidUnitLookups.length,0);
+    assert(s.grants.every(grant=>Number.isInteger(grant.id.id)&&Number.isInteger(grant.id.owner)));
+});
+await test('Commander XP grants resolve both unit objects and their component IDs',async()=>{
+    const s=await integration({points:0,xpInline:true,xpPoints:1});assert.equal(s.actions.grantCommanderXp(s.commander,10000).didChange,true);
+    assert.equal(s.actions.grantCommanderXp(s.commander.id,10000).didChange,true);assert.equal(s.grants.length,2);assert.equal(s.commander.xp.points,2);assert.equal(s.invalidUnitLookups.length,0);
+});
+await test('Direct experience and stored-point helpers distinguish objects from ComponentIDs',async()=>{
+    const s=await integration({points:0,xpInline:true,xpPoints:1});assert.equal(s.actions.applyCommanderExperienceGrant(s.commander,10000).didChange,true);
+    assert.equal(s.actions.applyCommanderExperienceGrant(s.commander.id,10000).didChange,true);
+    // This fixture exposes no native point setter. Failure must be clean rather
+    // than sending the whole unit object through the component-ID converter.
+    assert.equal(s.actions.applyCommanderStoredPointGrant(s.commander,'promotion',1).didChange,false);
+    assert.equal(s.actions.applyCommanderStoredPointGrant(s.commander.id,'promotion',1).didChange,false);
+    assert.equal(s.grants.length,2);assert.equal(s.commander.xp.points,2);assert.equal(s.invalidUnitLookups.length,0);
+});
+await test('Malformed unit handles cannot trigger mastery healing or XP mutation',async()=>{
+    const s=await integration({points:0,xpInline:true});
+    for(const value of [null,undefined,{}, {owner:0,id:{}}, {owner:0,id:10,type:'0'}, {owner:0,id:{owner:0,id:10,type:'0'}}, component(999)]){
+        assert.equal(s.actions.boostUnitForAutoplayMastery(value),false);assert.equal(s.actions.grantCommanderXp(value,10000).didChange,false);
+        assert.equal(s.actions.applyCommanderExperienceGrant(value,10000).didChange,false);assert.equal(s.actions.applyCommanderStoredPointGrant(value,'promotion',1).didChange,false);
+    }
+    assert.equal(s.grants.length,0);assert.equal(s.damageChanges.length,0);assert.equal(s.invalidUnitLookups.length,0);
+});
+await test('Display names and regular upgrade discovery accept actual unit objects',async()=>{
+    const s=await integration();const soldier=s.addSoldier(1);
+    assert.equal(s.actions.getUnitDisplayName(s.commander),'Commander 10');assert.equal(s.actions.getUnitDisplayName(s.commander.id),'Commander 10');
+    const available=s.actions.getUpgradeableUnits([s.commander,soldier]);assert.equal(available.length,1);assert(equalId(available[0].id,soldier.id));assert.equal(s.invalidUnitLookups.length,0);
+});
+await test('Passive commander counts do not borrow unit selection for context-dependent army upgrades',async()=>{
+    const s=await integration({points:0,formationNeedsSelection:true});s.commander.formationUpgrade=true;let selections=0;
+    const select=s.g.UI.Player.selectUnit;s.g.UI.Player.selectUnit=id=>{selections++;select(id);};
+    assert.equal(s.actions.getCommandersWithAdminActionsCount(false),0);assert.equal(selections,0);
+    assert.equal(s.actions.getCommandersWithAdminActionsCount(true),1);assert(selections>0);assert.equal(s.invalidUnitLookups.length,0);
 });
 
 const report={passed:tests.filter(t=>t.passed).length,failed:tests.filter(t=>!t.passed).length,failures:tests.filter(t=>!t.passed)};

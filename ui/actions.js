@@ -15,6 +15,7 @@ import { createReinforcementRuntime, ReinforcementRunner } from "./reinforcement
 export const Actions = new (class {
     // Store action callbacks here after the methods have been bound to this singleton.
     map = {};
+    commanderAutomationRevision = "2026-09-06-discovery-2";
 
     // Keep the shared unit and commander XP burst consistent across manual and autoplay helpers.
     militaryXpGrantAmount = 200000;
@@ -242,9 +243,6 @@ export const Actions = new (class {
         "toggle-dev-console": "Show or hide the dev panel console.",
         "reload-ui": "Reload the Civilization VII UI.",
     };
-
-    // Cache static promotion tree metadata by promotion class so commander upgrades stay fast.
-    promotionMetadataByClass = new Map();
 
     // Prevent multiple delayed refreshes from piling up at once.
     commanderAdminRefreshScheduled = false;
@@ -1426,11 +1424,19 @@ export const Actions = new (class {
         }
     }
 
+    // Native ComponentID.isValid only checks -1 sentinels, so a whole Unit
+    // object also passes it. Units.get requires the numeric component fields.
+    resolveUnit(unitOrId) {
+        const isUnit = unitOrId?.id != null && typeof unitOrId.id === "object";
+        const id = isUnit ? unitOrId.id : unitOrId;
+        if (!Number.isInteger(id?.id) || id.id < 0 || !Number.isInteger(id.owner)
+            || id.owner < 0 || !Number.isInteger(id.type)) return null;
+        return isUnit ? unitOrId : Units.get(id);
+    }
+
     // Resolve a readable unit name for status text and console logs.
     getUnitDisplayName(unitOrId) {
-        const unit = unitOrId?.id && typeof unitOrId.id === "object"
-            ? unitOrId
-            : ComponentID.isValid(unitOrId) ? Units.get(unitOrId) : null;
+        const unit = this.resolveUnit(unitOrId);
 
         if (!unit) {
             return "Commander";
@@ -1789,14 +1795,15 @@ export const Actions = new (class {
     }
 
     // Count how many commanders still have a promotion, commendation, or formation upgrade available.
-    getCommandersWithAdminActionsCount() {
-        return this.getCommandersWithAdminActions().length;
+    getCommandersWithAdminActionsCount(allowTemporarySelection = true) {
+        return this.getCommandersWithAdminActions(allowTemporarySelection).length;
     }
 
     // Return every local commander that currently has a promotion, commendation, or formation upgrade available.
-    getCommandersWithAdminActions() {
+    getCommandersWithAdminActions(allowTemporarySelection = true) {
         return this.getCommanderUnits().filter((commander) =>
-            Boolean(this.getNextCommanderAdminAction(commander, true)) || this.hasCommanderUnspentPromotions(commander),
+            this.hasCommanderUnspentPromotions(commander)
+            || Boolean(this.getNextCommanderAdminAction(commander, allowTemporarySelection)),
         );
     }
 
@@ -1810,7 +1817,11 @@ export const Actions = new (class {
         const canPromote = this.readNativeBooleanCandidates(experience, ["canPromote", "getCanPromote"]);
         if (!points && !commendations && !canPromote) return false;
         const promotionClass = GameInfo.Units.lookup(commander.type)?.PromotionClass;
-        return this.getPromotionMetadataForClass(promotionClass).some(candidate =>
+        const metadata = this.getPromotionMetadataForClass(promotionClass);
+        // Missing native data is not evidence that every node was purchased.
+        // Keep banked points in the bounded queue so later data can be retried.
+        if (!metadata.length || !this.getCommanderPromotionDiagnostics(commander).metadataAvailable) return true;
+        return metadata.some(candidate =>
             !experience.hasPromotion(candidate.disciplineType, candidate.promotionType)
             && (candidate.promotion.Commendation ? commendations > 0 : points > 0 || canPromote));
     }
@@ -2191,7 +2202,7 @@ export const Actions = new (class {
     getUpgradeableUnits(unitIds = null, allowTemporarySelection = true) {
         const localPlayerId = this.getLocalPlayerId();
         const candidateUnits = (unitIds ?? this.getLocalUnits().map((unit) => unit.id))
-            .map((unitId) => (ComponentID.isValid(unitId) ? Units.get(unitId) : unitId))
+            .map((unitId) => this.resolveUnit(unitId))
             .filter(
                 (unit) =>
                     unit !== null &&
@@ -2698,28 +2709,25 @@ export const Actions = new (class {
         return depthCache;
     }
 
-    // Build and cache the static promotion metadata for one promotion class.
+    // Rebuild as the stock model does: tables can populate after an early scan
+    // or change on an age/save transition. Never retain an empty/partial tree.
     getPromotionMetadataForClass(promotionClassType) {
         if (!promotionClassType) {
             return [];
         }
 
-        if (this.promotionMetadataByClass.has(promotionClassType)) {
-            return this.promotionMetadataByClass.get(promotionClassType);
-        }
-
         const metadata = [];
 
-        GameInfo.UnitPromotionClassSets.forEach((classSet, disciplineIndex) => {
+        GameInfo.UnitPromotionClassSets?.forEach((classSet, disciplineIndex) => {
             if (classSet.PromotionClassType !== promotionClassType) {
                 return;
             }
 
-            const details = GameInfo.UnitPromotionDisciplineDetails.filter(
+            const details = GameInfo.UnitPromotionDisciplineDetails?.filter(
                 (detail) =>
                     detail.UnitPromotionDisciplineType ===
                     classSet.UnitPromotionDisciplineType,
-            );
+            ) ?? [];
             const depthMap = this.getPromotionDepthMap(details);
             const seenPromotionTypes = new Set();
 
@@ -2730,7 +2738,7 @@ export const Actions = new (class {
 
                 seenPromotionTypes.add(detail.UnitPromotionType);
 
-                const promotion = GameInfo.UnitPromotions.lookup(detail.UnitPromotionType);
+                const promotion = GameInfo.UnitPromotions?.lookup(detail.UnitPromotionType);
 
                 if (!promotion) {
                     return;
@@ -2770,8 +2778,66 @@ export const Actions = new (class {
             return left.promotionType.localeCompare(right.promotionType);
         });
 
-        this.promotionMetadataByClass.set(promotionClassType, metadata);
         return metadata;
+    }
+
+    // Include both catalog and ownership counts: remaining=0 alone cannot
+    // distinguish an exhausted tree from missing native definitions.
+    getCommanderPromotionDiagnostics(commander) {
+        const experience = commander?.Experience;
+        const promotionClass = GameInfo.Units.lookup(commander?.type)?.PromotionClass;
+        const metadata = this.getPromotionMetadataForClass(promotionClass);
+        const regular = metadata.filter(c => !c.promotion.Commendation);
+        const commendations = metadata.filter(c => c.promotion.Commendation);
+        const owned = candidate => !!experience?.hasPromotion(candidate.disciplineType, candidate.promotionType);
+        const canPromote = this.readNativeBooleanCandidates(experience, ["canPromote", "getCanPromote"]);
+        const details = GameInfo.UnitPromotionDisciplineDetails;
+        const classes = GameInfo.UnitPromotionClassSets?.filter(c => c.PromotionClassType === promotionClass) ?? [];
+        const completeCatalog = classes.length > 0 && classes.every(c => {
+            const rows = details?.filter(d => d.UnitPromotionDisciplineType === c.UnitPromotionDisciplineType) ?? [];
+            return rows.length > 0 && rows.every(d => GameInfo.UnitPromotions?.lookup(d.UnitPromotionType));
+        });
+        const result = {
+            promotionClass: promotionClass ?? "unknown", totalNodes: metadata.length,
+            regularNodes: regular.length, commendationNodes: commendations.length,
+            ownedRegular: regular.filter(owned).length, ownedCommendations: commendations.filter(owned).length,
+            unownedNodes: metadata.filter(c => !owned(c)).length,
+            eligibleNodes: this.getCommanderPromotionCandidates(commander).length,
+            storedPromotionPoints: this.readNativeNumberCandidates(experience, ["getStoredPromotionPoints", "storedPromotionPoints"]),
+            storedCommendations: this.readNativeNumberCandidates(experience, ["getStoredCommendations", "storedCommendations"]),
+            nativePromotionsEarned: experience?.getTotalPromotionsEarned === undefined ? "unknown"
+                : this.readNativeNumberCandidates(experience, ["getTotalPromotionsEarned"]),
+            metadataAvailable: !!experience && metadata.length > 0 && completeCatalog,
+            canPromote,
+        };
+        result.state = !result.metadataAvailable ? "promotion metadata unavailable or incomplete"
+            : result.unownedNodes === 0 ? "all promotion nodes already purchased; surplus points cannot buy them again"
+                : result.eligibleNodes > 0 ? "eligible upgrades available"
+                    : "unbought nodes remain; native eligibility currently blocks spending";
+        return result;
+    }
+
+    formatCommanderPromotionDiagnostics(commander) {
+        const d = this.getCommanderPromotionDiagnostics(commander);
+        return `class=${d.promotionClass} · metadata=${d.metadataAvailable ? "ready" : "unavailable/incomplete"}`
+            + ` · regular=${d.ownedRegular}/${d.regularNodes} bought · commendations=${d.ownedCommendations}/${d.commendationNodes} bought`
+            + ` · nativeEarned=${d.nativePromotionsEarned} · stored=${d.storedPromotionPoints}/${d.storedCommendations}`
+            + ` · eligible=${d.eligibleNodes} · ${d.state}`;
+    }
+
+    getIdleCommanderUpgradeMessage() {
+        const commanders = this.getCommanderUnits();
+        const banked = commanders.filter(c => {
+            const d = this.captureCommanderPointState(c);
+            return d.promotionPoints > 0 || d.commendationPoints > 0 || d.canPromote;
+        });
+        if (!banked.length) return "No commanders have spendable upgrades right now.";
+        const unknown = banked.filter(c => !this.getCommanderPromotionDiagnostics(c).metadataAvailable);
+        if (unknown.length) return `${unknown.length} commanders have points but promotion metadata is unavailable; not verified as fully upgraded.`;
+        const complete = banked.filter(c => this.getCommanderPromotionDiagnostics(c).unownedNodes === 0);
+        return complete.length === banked.length
+            ? `${complete.length} commanders already have all promotion nodes; their surplus points cannot be spent.`
+            : "Commander points remain, but the game reports no eligible unbought nodes.";
     }
 
     // Collect every non-commendation promotion node a commander can ever spend regular promotion points on.
@@ -3001,9 +3067,7 @@ export const Actions = new (class {
 
     // Try the likely commander XP mutation paths until one actually changes the native-backed commander state.
     applyCommanderExperienceGrant(unitOrId, amount, beforeState = null) {
-        const commander = ComponentID.isValid(unitOrId)
-            ? Units.get(unitOrId)
-            : unitOrId;
+        const commander = this.resolveUnit(unitOrId);
 
         if (!commander?.isCommanderUnit || !Number.isFinite(amount) || amount <= 0) {
             const fallbackState = commander
@@ -3126,9 +3190,7 @@ export const Actions = new (class {
 
     // Grant the configured commander XP burst directly instead of topping up to the old safe cap.
     grantCommanderXp(unitOrId, amount = this.militaryXpGrantAmount) {
-        const commander = ComponentID.isValid(unitOrId)
-            ? Units.get(unitOrId)
-            : unitOrId;
+        const commander = this.resolveUnit(unitOrId);
 
         if (!commander?.isCommanderUnit) {
             return {
@@ -3243,9 +3305,7 @@ export const Actions = new (class {
         amount,
         beforeState = null,
     ) {
-        const commander = ComponentID.isValid(unitOrId)
-            ? Units.get(unitOrId)
-            : unitOrId;
+        const commander = this.resolveUnit(unitOrId);
 
         if (!commander?.isCommanderUnit || !Number.isFinite(amount) || amount <= 0) {
             const fallbackState = commander
@@ -3555,8 +3615,8 @@ export const Actions = new (class {
                 this.markManualCommanderComplete(commander.id, !unspent);
                 console.log(
                     unspent
-                        ? `Dev panel: commander ${this.getUnitDisplayName(commander)} skipped: points remain but no legal promotion is available.`
-                        : `Dev panel: commander ${this.getUnitDisplayName(commander)} finished upgrading.`,
+                        ? `Dev panel: commander ${this.getUnitDisplayName(commander)} skipped: ${this.formatCommanderPromotionDiagnostics(commander)}.`
+                        : `Dev panel: commander ${this.getUnitDisplayName(commander)} finished upgrading: ${this.formatCommanderPromotionDiagnostics(commander)}.`,
                 );
                 continue;
             }
@@ -3801,7 +3861,7 @@ export const Actions = new (class {
     // Buff one local unit for autoplay mastery, granting the same direct XP burst to commanders too.
     boostUnitForAutoplayMastery(unitOrId) {
         const localPlayerId = this.getLocalPlayerId();
-        const unit = ComponentID.isValid(unitOrId) ? Units.get(unitOrId) : unitOrId;
+        const unit = this.resolveUnit(unitOrId);
 
         if (!unit || localPlayerId === null || unit.owner !== localPlayerId) {
             return false;
@@ -4098,9 +4158,10 @@ export const Actions = new (class {
                 "upgrade-all-units",
                 "upgrade-all military",
             );
-            this.setUnitsStatus("No local units or commanders can upgrade right now.");
-            this.setCommanderStatus("Commanders: ready");
-            console.log("Dev panel: no local units or commanders can upgrade right now.");
+            const commanderSummary = this.getIdleCommanderUpgradeMessage();
+            this.setUnitsStatus(`No regular unit upgrades available. ${commanderSummary}`);
+            this.setCommanderStatus(commanderSummary);
+            console.log(`Dev panel: no regular unit upgrades available. ${commanderSummary}`);
             this.scheduleUnitsStatusReset();
             return;
         }
@@ -4186,6 +4247,7 @@ export const Actions = new (class {
             : "  none";
         const inspectionLog = [
             "Dev panel: commander inspection",
+            `Commander automation revision: ${this.commanderAutomationRevision}`,
             `Selected unit: ${selectedUnitLabel}${this.isSameComponentId(selectedUnit.id, commander.id) ? " (commander)" : " (attached unit)"}`,
             `Commander: ${commanderLabel}`,
             `Commander type: ${commander.type ?? "unknown"}`,
@@ -4196,9 +4258,10 @@ export const Actions = new (class {
             `Stored commendations: ${xpState.storedCommendations}`,
             `Remaining regular promotions: ${xpState.remainingPromotionCount}`,
             `Remaining commendations: ${xpState.remainingCommendationCount}`,
-            `Promotion/commendation cap reached: ${this.hasCommanderXpGrantReachedCap(xpState) ? "yes" : "no"}`,
+            `Promotion tree audit: ${this.formatCommanderPromotionDiagnostics(commander)}`,
+            `Banked points cover remaining known nodes: ${this.getCommanderPromotionDiagnostics(commander).metadataAvailable ? (this.hasCommanderXpGrantReachedCap(xpState) ? "yes" : "no") : "unknown (metadata unavailable)"}`,
             `Native canPromote: ${adminState.canPromote ? "yes" : "no"}`,
-            `Potential tree actions (ignoring stored-point affordability): ${potentialPromotionCandidates.length}`,
+            `Native eligible tree actions (including point affordability): ${potentialPromotionCandidates.length}`,
             `Experience methods: ${methodDiagnostics.experienceMethods.join(", ") || "none found"}`,
             `Unit methods: ${methodDiagnostics.unitMethods.join(", ") || "none found"}`,
             `Detected spendable actions: ${availableActions.length}`,
@@ -4263,8 +4326,9 @@ export const Actions = new (class {
         if (commanders.length <= 0) {
             this.manualCommanderUpgradeRequested = false;
             this.resetManualCommanderProgress();
-            this.setCommanderStatus("No commanders need upgrades right now.");
-            console.log("Dev panel: no commanders need upgrades right now.");
+            const summary = this.getIdleCommanderUpgradeMessage();
+            this.setCommanderStatus(summary);
+            console.log(`Dev panel: ${summary}`);
             this.scheduleCommanderStatusReset();
             return;
         }
@@ -4987,13 +5051,14 @@ export const Actions = new (class {
         const lines = [
             "Dev panel: debug snapshot",
             `Captured: ${new Date().toISOString()}`,
+            `Commander automation revision: ${this.commanderAutomationRevision}`,
             `Trigger: ${trigger}`,
             `Session: ${metadata.sessionName}`,
             `Player: ${metadata.playerName} (id=${metadata.localPlayerId ?? "unknown"})`,
             `Leader/Civ: ${metadata.leaderName} / ${metadata.civName}`,
             `Interface mode: ${InterfaceMode.getCurrent?.() ?? "unknown"}`,
             `Environment: profiler=${this.performanceProfilerEnabled ? "on" : "off"} · fastGameplay=${this.fastGameplayEnabled ? "on" : "off"} · console=${Console.isVisible() ? "open" : "closed"} · autoplay=${autoplayState}`,
-            `Counts: cities=${localCities.length} · localUnits=${localUnits.length} · commanders=${commanders.length} · commanderActions=${this.getCommandersWithAdminActionsCount()} · reinforceable=${this.getReinforceableUnitsCount()} · directUpgradeable=${this.getDirectUpgradeableUnitsCount()}`,
+            `Counts: cities=${localCities.length} · localUnits=${localUnits.length} · commanders=${commanders.length} · commanderActions=${this.getCommandersWithAdminActionsCount(false)} · reinforceable=${this.getReinforceableUnitsCount()} · directUpgradeable=${this.getDirectUpgradeableUnitsCount()}`,
             `Queues: commanderAdmin=${queueCommanderAdmin} · reinforcements=${queueReinforcements} · unitUpgrades=${queueUnitUpgrades}`,
             "Status lines:",
             `  ${this.getStatusText(".dev-panel-status--performance", this.performanceProfilerEnabled ? "Profiler: sampling frame times…" : this.fastGameplayEnabled ? "Fast gameplay enabled." : "Performance: ready")}`,
@@ -5015,6 +5080,7 @@ export const Actions = new (class {
             lines.push(
                 `  Commander XP: level=${commanderXpState.level} · xp=${commanderXpState.experiencePoints}/${commanderXpState.experienceToNextLevel} · storedPromotions=${commanderXpState.storedPromotionPoints} · storedCommendations=${commanderXpState.storedCommendations}`,
                 `  Commander nodes: remainingPromotions=${commanderXpState.remainingPromotionCount} · remainingCommendations=${commanderXpState.remainingCommendationCount} · canPromote=${commanderAdminState.canPromote ? "yes" : "no"} · directActions=${commanderActions.length}`,
+                `  Commander tree audit: ${this.formatCommanderPromotionDiagnostics(commander)}`,
             );
 
             if (commanderActions.length > 0) {
@@ -5030,6 +5096,11 @@ export const Actions = new (class {
             }
         }
 
+        lines.push("Commander promotion audits (all local commanders):");
+        commanders.forEach(unit => {
+            lines.push(`  ${this.getUnitDisplayName(unit)} · id=${unit.id.owner}:${unit.id.id}:${unit.id.type}`
+                + ` · ${this.formatCommanderPromotionDiagnostics(unit)}`);
+        });
         lines.push(
             "Progression:",
             `  ${this.buildProgressionSnapshotLine("tech", player)}`,
