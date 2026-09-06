@@ -9,6 +9,7 @@ import { Logs } from "./logs.js";
 import { InfiniteMovement } from "./infinite-movement.js";
 import { AttributeSpending } from "./attribute-spending.js";
 import { BuildingAutomation } from "./building-automation.js";
+import { CityGrowth } from "./city-growth.js";
 import { createReinforcementRuntime, ReinforcementRunner } from "./reinforcement.js";
 
 export const Actions = new (class {
@@ -214,7 +215,7 @@ export const Actions = new (class {
         "add-happiness": "Grant 100 happiness.",
         "complete-production": "Complete production in every city.",
         "build-all-buildings": "Automatically purchase or instantly complete available buildings across your settlements, prioritizing urgent needs, unique quarters, advisors, and useful yields, then wonders. Choose legal sites and preserve wonder space. Click again to stop.",
-        "add-population": "Add 1 rural population to every city.",
+        "add-population": "Grow every local settlement through all legal rural plots and available specialist slots, with no fixed population cap. Click again to stop.",
         "spawn-settler": "Spawn a settler at your capital.",
         "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or formation upgrades, including land, naval, and air commanders.",
         "inspect-selected-commander": "Log the selected commander, or the selected unit's commander, including level, stored promotion points, stored commendations, remaining promotions, remaining commendations, and currently detected upgrade actions.",
@@ -427,8 +428,8 @@ export const Actions = new (class {
             "complete-production": this.completeProduction,
             "build-all-buildings": BuildingAutomation.toggle,
 
-            // Add one rural population to every city.
-            "add-population": this.addPopulation,
+            // Start or stop settlement growth from the manual button.
+            "add-population": CityGrowth.toggle,
 
             // Spawn a settler near the capital.
             "spawn-settler": this.spawnSettler,
@@ -3868,7 +3869,7 @@ export const Actions = new (class {
     applyAutoplayMasteryBiasSupport(player, context) {
         const biasKey = this.normalizeAutoplayMasteryBias(this.autoplayMasteryBias);
         const summary = {
-            populationBursts: 0,
+            growthRequested: false,
             settlersSpawned: 0,
             extraRegularUnitsBuffed: 0,
             extraCommandersPrimed: 0,
@@ -3892,14 +3893,14 @@ export const Actions = new (class {
 
             case "science": {
                 this.addPopulation();
-                summary.populationBursts += context.cityCount;
+                summary.growthRequested = true;
                 summary.forcedResearchSweep = true;
                 break;
             }
 
             case "expansion": {
                 this.addPopulation();
-                summary.populationBursts += context.cityCount;
+                summary.growthRequested = true;
 
                 if (
                     this.shouldSpawnAutoplayExpansionSettler(
@@ -3918,7 +3919,7 @@ export const Actions = new (class {
             default: {
                 if (context.needsSetup) {
                     this.addPopulation();
-                    summary.populationBursts += context.cityCount;
+                    summary.growthRequested = true;
                 }
 
                 break;
@@ -4033,11 +4034,11 @@ export const Actions = new (class {
 
         this.setAutoplayStatus(
             needsSetup
-                ? `Autoplay: ${biasLabel} setup ran — ${cityCount} cities, ${buffSummary.regularUnitsBuffed + biasSummary.extraRegularUnitsBuffed} regular units buffed, ${buffSummary.commandersPrimed + biasSummary.extraCommandersPrimed} commanders primed${biasSummary.populationBursts > 0 ? `, +pop to ${biasSummary.populationBursts} city slots` : ""}${biasSummary.settlersSpawned > 0 ? `, ${biasSummary.settlersSpawned} settler spawned` : ""}${shouldPrimeResearch ? ", research sweep armed" : ""}.`
-                : `Autoplay: ${biasLabel} upkeep ran — production, economy, healing, ${buffSummary.commandersPrimed + biasSummary.extraCommandersPrimed} commanders primed${biasSummary.extraRegularUnitsBuffed > 0 ? `, ${biasSummary.extraRegularUnitsBuffed} regular units re-buffed` : ""}${biasSummary.populationBursts > 0 ? `, +pop to ${biasSummary.populationBursts} city slots` : ""}${biasSummary.settlersSpawned > 0 ? `, ${biasSummary.settlersSpawned} settler spawned` : ""}${shouldPrimeResearch ? ", research sweep armed" : ""}.`,
+                ? `Autoplay: ${biasLabel} setup ran — ${cityCount} cities, ${buffSummary.regularUnitsBuffed + biasSummary.extraRegularUnitsBuffed} regular units buffed, ${buffSummary.commandersPrimed + biasSummary.extraCommandersPrimed} commanders primed${biasSummary.growthRequested ? ", city growth queued" : ""}${biasSummary.settlersSpawned > 0 ? `, ${biasSummary.settlersSpawned} settler spawned` : ""}${shouldPrimeResearch ? ", research sweep armed" : ""}.`
+                : `Autoplay: ${biasLabel} upkeep ran — production, economy, healing, ${buffSummary.commandersPrimed + biasSummary.extraCommandersPrimed} commanders primed${biasSummary.extraRegularUnitsBuffed > 0 ? `, ${biasSummary.extraRegularUnitsBuffed} regular units re-buffed` : ""}${biasSummary.growthRequested ? ", city growth queued" : ""}${biasSummary.settlersSpawned > 0 ? `, ${biasSummary.settlersSpawned} settler spawned` : ""}${shouldPrimeResearch ? ", research sweep armed" : ""}.`,
         );
         console.log(
-            `Dev panel: autoplay ${biasLabel.toLowerCase()} master ${needsSetup ? "setup" : reason} complete (turn=${this.autoplayMasteryTurnCounter}, cities=${cityCount}, settlers=${settlerCount}, regularUnits=${buffSummary.regularUnitsBuffed + biasSummary.extraRegularUnitsBuffed}, commanders=${buffSummary.commandersPrimed + biasSummary.extraCommandersPrimed}, populationBursts=${biasSummary.populationBursts}, spawnedSettlers=${biasSummary.settlersSpawned}, research=${shouldPrimeResearch ? "primed" : "steady"}).`,
+            `Dev panel: autoplay ${biasLabel.toLowerCase()} master ${needsSetup ? "setup" : reason} complete (turn=${this.autoplayMasteryTurnCounter}, cities=${cityCount}, settlers=${settlerCount}, regularUnits=${buffSummary.regularUnitsBuffed + biasSummary.extraRegularUnitsBuffed}, commanders=${buffSummary.commandersPrimed + biasSummary.extraCommandersPrimed}, growthRequested=${biasSummary.growthRequested}, spawnedSettlers=${biasSummary.settlersSpawned}, research=${shouldPrimeResearch ? "primed" : "steady"}).`,
         );
     }
 
@@ -4224,7 +4225,7 @@ export const Actions = new (class {
         }
 
         this.setEmpireStatus(
-            "Empire: tune-up launched — economy, cities, armies, and research queued.",
+            "Empire: tune-up launched — economy, city growth, armies, and research queued.",
         );
         console.log("Dev panel: launching full empire maintenance.");
 
@@ -4606,6 +4607,7 @@ export const Actions = new (class {
         InfiniteMovement.refreshLabel();
         AttributeSpending.refreshStatus();
         BuildingAutomation.refreshStatus();
+        CityGrowth.refreshStatus();
         this.updatePerformanceProfilerLabel();
         this.autoplayMasteryEnabled = this.isAutoplayMasteryEnabled();
         this.autoplayMasteryBias = this.getAutoplayMasteryBias();
@@ -5722,11 +5724,8 @@ export const Actions = new (class {
     }
 
     addPopulation() {
-        // Iterate over a safe city list so this action does nothing instead of crashing.
-        this.getLocalCities().forEach((city) => {
-            // Add one rural population to each city.
-            city?.addRuralPopulation?.(1);
-        });
+        // Maintenance and autoplay can request growth repeatedly without stopping it.
+        return CityGrowth.start();
     }
 
     spawnSettler() {

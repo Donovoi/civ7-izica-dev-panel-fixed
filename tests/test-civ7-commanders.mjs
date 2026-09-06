@@ -132,6 +132,7 @@ async function integration(options={}) {
         '/core/ui/utilities/utilities-component-id.js':{ComponentID:{isValid:id=>Number.isInteger(id?.id)&&id.id>=0&&Number.isInteger(id?.owner),isMatch:equalId}},
         './storage.js':{Storage:{get:()=>null,set(){}}},'./console.js':{Console:{}},'./logs.js':{Logs:{}},
         './attribute-spending.js':{AttributeSpending:{}},'./building-automation.js':{BuildingAutomation:{}},
+        './city-growth.js':{CityGrowth:{start(){},toggle(){},refreshStatus(){}}},
     };
     const cache=new Map();
     async function load(name){

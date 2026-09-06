@@ -200,6 +200,7 @@ async function integration(options={}) {
         '/core/ui/utilities/utilities-component-id.js':{ComponentID:{isValid:i=>i?.id>=0,isMatch:equalId}},
         './storage.js':{Storage:{get:()=>null,set(){}}},'./console.js':{Console:{}},'./logs.js':{Logs:{}},
         './attribute-spending.js':{AttributeSpending:{}},'./building-automation.js':{BuildingAutomation:{}},
+        './city-growth.js':{CityGrowth:{start(){},toggle(){},refreshStatus(){}}},
     };
     const cache=new Map();
     async function load(name) {
