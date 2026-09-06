@@ -1,4 +1,4 @@
-import { P as Panel } from '/core/ui/panel-support.chunk.js';
+import Panel from '/core/ui/panel-support.js';
 import ContextManager from '/core/ui/context-manager/context-manager.js';
 import { InterfaceMode, InterfaceModeChangedEventName } from '/core/ui/interface-modes/interface-modes.js';
 

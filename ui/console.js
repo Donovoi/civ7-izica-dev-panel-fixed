@@ -1,4 +1,4 @@
-import { MustGetElement } from '/core/ui/utilities/utilities-dom.chunk.js';
+import { MustGetElement } from '/core/ui/utilities/utilities-dom.js';
 
 import { Storage } from './storage.js';
 import { Logs } from "./logs.js";

@@ -1,0 +1,4 @@
+/tests/fixtures/civ7-attribute-fixture.json
+/tests/civ7-*-tests.json
+__pycache__/
+node_modules/

@@ -1,11 +1,14 @@
 import ContextManager from "/core/ui/context-manager/context-manager.js";
 import { InterfaceMode } from "/core/ui/interface-modes/interface-modes.js";
-import { C as ComponentID } from "/core/ui/utilities/utilities-component-id.chunk.js";
+import { ComponentID } from "/core/ui/utilities/utilities-component-id.js";
 
 import { Storage } from "./storage.js";
 import { Console } from "./console.js";
 import { Logs } from "./logs.js";
 import { InfiniteMovement } from "./infinite-movement.js";
+import { AttributeSpending } from "./attribute-spending.js";
+import { BuildingAutomation } from "./building-automation.js";
+import { createReinforcementRuntime, ReinforcementRunner } from "./reinforcement.js";
 
 export const Actions = new (class {
     // Store action callbacks here after the methods have been bound to this singleton.
@@ -65,6 +68,7 @@ export const Actions = new (class {
 
     // Track whether the user manually kicked off a reinforce-all sweep.
     manualReinforcementRequested = false;
+    reinforcementPreparationPending = false;
 
     // Track whether the user manually kicked off an upgrade-all-units sweep.
     manualUnitUpgradeRequested = false;
@@ -203,8 +207,10 @@ export const Actions = new (class {
         "add-gold": "Grant 1,000,000 gold.",
         "add-influence": "Grant 1,000,000 influence.",
         "add-wildcard-attribute-point": "Grant 1 wildcard attribute point.",
+        "spend-all-attribute-points": "Finish every available non-repeatable attribute upgrade, then balance repeatable bonuses using all remaining spendable points. Click again to stop.",
         "add-happiness": "Grant 100 happiness.",
         "complete-production": "Complete production in every city.",
+        "build-all-buildings": "Automatically purchase or instantly complete available buildings across your settlements, prioritizing urgent needs, unique quarters, advisors, and useful yields, then wonders. Choose legal sites and preserve wonder space. Click again to stop.",
         "add-population": "Add 1 rural population to every city.",
         "spawn-settler": "Spawn a settler at your capital.",
         "upgrade-commander": "Upgrade every commander that can spend promotions, commendations, or formation upgrades, including land, naval, and air commanders.",
@@ -397,6 +403,8 @@ export const Actions = new (class {
             // Grant one wildcard attribute point.
             "add-wildcard-attribute-point": this.addWildcardAttributePoint,
 
+            "spend-all-attribute-points": AttributeSpending.toggle,
+
             // Start a golden age / celebration.
             "start-golden-age": this.startGoldenAge,
 
@@ -414,6 +422,7 @@ export const Actions = new (class {
 
             // Instantly finish city production queues.
             "complete-production": this.completeProduction,
+            "build-all-buildings": BuildingAutomation.toggle,
 
             // Add one rural population to every city.
             "add-population": this.addPopulation,
@@ -1942,22 +1951,9 @@ export const Actions = new (class {
         }, delay);
     }
 
-    // Count how many local non-commander units can currently reinforce into a commander.
+    // Count soldiers that can join directly, walk to a commander, or reinforce.
     getReinforceableUnitsCount() {
-        return this.getLocalUnits().filter((unit) => {
-            if (!unit || unit.isCommanderUnit) {
-                return false;
-            }
-
-            return Boolean(
-                Game.UnitOperations?.canStart(
-                    unit.id,
-                    "UNITOPERATION_REINFORCE_ARMY",
-                    {},
-                    false,
-                )?.Success,
-            );
-        }).length;
+        return this.getLocalUnits().filter(unit => this.getReinforcementActionForUnit(unit.id)).length;
     }
 
     // Keep the commander/admin status line in sync while a manual action is running.
@@ -2040,6 +2036,7 @@ export const Actions = new (class {
     finishManualAdminStatusIfIdle() {
         if (this.manualReinforcementRequested && this.manualCommanderUpgradeRequested) {
             if (
+                this.reinforcementPreparationPending ||
                 this.reinforcementSweepRequested ||
                 this.reinforcementInFlight ||
                 this.commanderAdminInFlight ||
@@ -2066,7 +2063,7 @@ export const Actions = new (class {
         }
 
         if (this.manualReinforcementRequested) {
-            if (this.reinforcementSweepRequested || this.reinforcementInFlight) {
+            if (this.reinforcementPreparationPending || this.reinforcementSweepRequested || this.reinforcementInFlight) {
                 this.updateManualAdminStatus();
                 return;
             }
@@ -2119,7 +2116,8 @@ export const Actions = new (class {
             return;
         }
 
-        this.setCommanderStatus("Commanders: ready");
+        // Queue drains can call this more than once. Leave the completion
+        // message visible until the existing status-reset timer expires.
     }
 
     // Finalize the visible status when a manual upgrade-all-units sweep becomes idle.
@@ -2379,74 +2377,24 @@ export const Actions = new (class {
         this.finishManualUnitUpgradeStatusIfIdle();
     }
 
-    // Score one reinforce target so the sweep can prefer the closest valid commander plot.
-    getReinforcementScore(unitId, targetPlot) {
-        const pathToCommander = Units.getPathTo?.(unitId, targetPlot);
-        const turns = Array.isArray(pathToCommander?.turns)
-            ? Math.max(...pathToCommander.turns, 0)
-            : 0;
-        const steps = Array.isArray(pathToCommander?.plots)
-            ? pathToCommander.plots.length
-            : 0;
-
-        return turns * 1000 + steps;
+    getReinforcementService() {
+        return this.reinforcementService ??= new ReinforcementRunner(() => createReinforcementRuntime({
+            GameContext, Players, Units, GameInfo, Armies, Game, GameplayMap,
+            UnitOperationMoveModifiers, CombatTypes,
+            directions: [DirectionTypes.DIRECTION_EAST, DirectionTypes.DIRECTION_NORTHEAST,
+                DirectionTypes.DIRECTION_NORTHWEST, DirectionTypes.DIRECTION_WEST,
+                DirectionTypes.DIRECTION_SOUTHWEST, DirectionTypes.DIRECTION_SOUTHEAST],
+        }), InfiniteMovement);
     }
 
-    // Pick the best valid reinforce plot for a unit from the engine-provided plot list.
-    getBestReinforcementPlot(unitId, plotIndexes) {
-        let bestPlot = null;
-        let bestScore = Number.POSITIVE_INFINITY;
-
-        plotIndexes.forEach((plotIndex) => {
-            const targetPlot = GameplayMap.getLocationFromIndex(plotIndex);
-
-            if (!targetPlot) {
-                return;
-            }
-
-            const score = this.getReinforcementScore(unitId, targetPlot);
-
-            if (bestPlot === null || score < bestScore) {
-                bestPlot = targetPlot;
-                bestScore = score;
-            }
-        });
-
-        return bestPlot;
-    }
-
-    // Build a current reinforcement action for one unit if the engine says it is valid right now.
+    // Native reinforcement alone excludes soldiers that can walk and pack instead.
     getReinforcementActionForUnit(unitId) {
-        const unit = Units.get(unitId);
-
-        if (!unit || unit.isCommanderUnit) {
+        try {
+            return this.getReinforcementService().plan(unitId);
+        } catch (error) {
+            console.warn(`Dev panel: could not plan reinforcement for unit ${unitId?.id}: ${error.message}`);
             return null;
         }
-
-        const result = Game.UnitOperations?.canStart(
-            unit.id,
-            "UNITOPERATION_REINFORCE_ARMY",
-            {},
-            false,
-        );
-
-        if (!result?.Success || !result.Plots?.length) {
-            return null;
-        }
-
-        // We intentionally do not hardcode any slot or stack limit here.
-        // The engine already knows the current free-space and same-slot stacking rules.
-        const targetPlot = this.getBestReinforcementPlot(unit.id, result.Plots);
-
-        if (!targetPlot) {
-            return null;
-        }
-
-        return {
-            unitId: unit.id,
-            targetPlot,
-            score: this.getReinforcementScore(unit.id, targetPlot),
-        };
     }
 
     // Build a sorted reinforcement queue from the current game state.
@@ -2486,7 +2434,22 @@ export const Actions = new (class {
 
     // Build the reinforcement queue and launch the visible manual sweep once movement is already primed.
     beginManualReinforcementSweep() {
+        if (this.getLocalPlayerId() !== this.reinforcementPreparationPlayerId) {
+            this.reinforcementPreparationPending = false;
+            this.manualReinforcementRequested = false;
+            this.releaseTemporaryInfiniteMovement("reinforce-all-units", "reinforce-all");
+            this.setCommanderStatus("Reinforcement stopped: local player changed.");
+            return;
+        }
+        // Restoring movement is an asynchronous game request. Allow the native
+        // state to catch up before asking pathfinding for exhausted soldiers.
+        if (this.getReinforcementService().awaitingMovement()
+            && Date.now() - this.reinforcementPreparationStartedAt < 5000) {
+            setTimeout(() => this.beginManualReinforcementSweep(), 75);
+            return;
+        }
         const reinforceableUnits = this.replaceReinforcementQueue();
+        this.reinforcementPreparationPending = false;
 
         if (reinforceableUnits <= 0) {
             this.manualReinforcementRequested = false;
@@ -2495,8 +2458,9 @@ export const Actions = new (class {
                 "reinforce-all-units",
                 "reinforce-all",
             );
-            this.setCommanderStatus("No units can reinforce right now.");
-            console.log("Dev panel: no units can reinforce right now.");
+            const reason = this.getReinforcementService().explain();
+            this.setCommanderStatus(reason);
+            console.log(`Dev panel: ${reason}`);
             this.scheduleCommanderStatusReset();
             return;
         }
@@ -2532,7 +2496,7 @@ export const Actions = new (class {
     }
 
     // Mark one queued reinforcement step as completed and advance manual progress.
-    completeReinforcementStep(unitId) {
+    completeReinforcementStep(unitId, succeeded) {
         if (!this.isSameComponentId(this.reinforcementInFlight?.unitId, unitId)) {
             return;
         }
@@ -2544,41 +2508,22 @@ export const Actions = new (class {
                 this.manualReinforcementProcessed + 1,
                 this.manualReinforcementTotal,
             );
-            this.manualReinforcementSucceeded = Math.min(
-                this.manualReinforcementSucceeded + 1,
-                this.manualReinforcementProcessed,
-            );
+            if (succeeded) this.manualReinforcementSucceeded += 1;
+            else this.manualReinforcementSkipped += 1;
         }
     }
 
-    // Send one reinforce request for a unit to the chosen commander plot.
-    sendReinforcementRequest(unitId, targetPlot) {
-        const result = Game.UnitOperations?.canStart(
-            unitId,
-            "UNITOPERATION_REINFORCE_ARMY",
-            {},
-            false,
-        );
-        const targetPlotIndex = GameplayMap.getIndexFromLocation(targetPlot);
-
-        if (!result?.Success || !result.Plots?.includes(targetPlotIndex)) {
-            return false;
+    // Move and pack one soldier, confirming each engine step before continuing.
+    sendReinforcementRequest(unitId) {
+        if (!this.getTemporaryInfiniteMovementBorrowCount("reinforce-all-units")) {
+            this.borrowTemporaryInfiniteMovement("reinforce-all-units");
         }
-
-        Game.UnitOperations?.sendRequest(unitId, "UNITOPERATION_REINFORCE_ARMY", {
-            X: targetPlot.x,
-            Y: targetPlot.y,
+        InfiniteMovement.restoreUnit(unitId);
+        return this.getReinforcementService().start(unitId, (succeeded, reason) => {
+            this.completeReinforcementStep(unitId, succeeded);
+            console.log(`Dev panel: unit ${unitId.id}: ${reason}`);
+            this.scheduleCommanderAdminProcessing();
         });
-
-        // Fall back to a delayed refresh in case no immediate engine event fires.
-        setTimeout(() => {
-            if (this.isSameComponentId(this.reinforcementInFlight?.unitId, unitId)) {
-                this.completeReinforcementStep(unitId);
-                this.scheduleCommanderAdminProcessing();
-            }
-        }, 1000);
-
-        return true;
     }
 
     // Consume any pending reinforce-all work before moving on to commander admin actions.
@@ -2628,7 +2573,6 @@ export const Actions = new (class {
                 if (
                     this.sendReinforcementRequest(
                         refreshedReinforcement.unitId,
-                        refreshedReinforcement.targetPlot,
                     )
                 ) {
                     this.updateManualAdminStatus();
@@ -4137,21 +4081,16 @@ export const Actions = new (class {
 
     // Queue every currently reinforceable unit and let the engine assign them to the closest valid commander target.
     reinforceAllAvailableUnits() {
-        if (this.borrowTemporaryInfiniteMovement("reinforce-all-units")) {
-            this.setCommanderStatus(
-                "Infinite movement enabled; scanning for the closest reinforcement targets…",
-            );
-            console.log(
-                "Dev panel: infinite movement enabled automatically for reinforce-all.",
-            );
-
-            requestAnimationFrame(() => {
-                this.beginManualReinforcementSweep();
-            });
-            return;
-        }
-
-        this.beginManualReinforcementSweep();
+        if (this.manualReinforcementRequested || this.reinforcementInFlight || this.reinforcementSweepRequested) return;
+        // Latch before the deferred scan so repeated clicks cannot borrow twice.
+        this.manualReinforcementRequested = true;
+        this.reinforcementPreparationPending = true;
+        this.reinforcementPreparationStartedAt = Date.now();
+        this.reinforcementPreparationPlayerId = this.getLocalPlayerId();
+        this.borrowTemporaryInfiniteMovement("reinforce-all-units");
+        InfiniteMovement.restoreAllMovement();
+        this.setCommanderStatus("Infinite movement enabled; finding routes to commanders…");
+        requestAnimationFrame(() => this.beginManualReinforcementSweep());
     }
 
     // Build the manual upgrade-all-military sweep after any temporary movement restore has had a frame to propagate.
@@ -4433,6 +4372,10 @@ export const Actions = new (class {
 
     // Continue a reinforce-all sweep when a unit is successfully added to an army.
     onUnitAddedToArmy(data) {
+        if (this.reinforcementService?.isActive(this.getEventUnitId(data))) {
+            this.reinforcementService.wake();
+            return;
+        }
         const localPlayerId = this.getLocalPlayerId();
         const unitId = this.getEventUnitId(data);
         const unit = Units.get(unitId) ?? data?.unit ?? data?.initiatingUnit ?? null;
@@ -4448,14 +4391,18 @@ export const Actions = new (class {
             return;
         }
 
-        this.completeReinforcementStep(unit.id);
-
         this.reinforcementSweepRequested = this.reinforcementQueue.length > 0;
         this.scheduleCommanderAdminProcessing();
     }
 
     // Continue a reinforce-all sweep when a unit starts traveling to its commander off-map.
     onUnitRemovedFromMap(data) {
+        // Removal can also mean death. Only the runner's army-state check is
+        // allowed to mark this soldier as successfully assigned.
+        if (this.reinforcementService?.isActive(this.getEventUnitId(data))) {
+            this.reinforcementService.wake();
+            return;
+        }
         const localPlayerId = this.getLocalPlayerId();
         const unitId = this.getEventUnitId(data);
         const unit = Units.get(unitId) ?? data?.unit ?? null;
@@ -4470,8 +4417,6 @@ export const Actions = new (class {
         ) {
             return;
         }
-
-        this.completeReinforcementStep(unit.id);
 
         this.reinforcementSweepRequested = this.reinforcementQueue.length > 0;
         this.scheduleCommanderAdminProcessing();
@@ -4620,6 +4565,8 @@ export const Actions = new (class {
 
         this.applyFastGameplaySettings(this.isFastGameplayEnabled());
         InfiniteMovement.refreshLabel();
+        AttributeSpending.refreshStatus();
+        BuildingAutomation.refreshStatus();
         this.updatePerformanceProfilerLabel();
         this.autoplayMasteryEnabled = this.isAutoplayMasteryEnabled();
         this.autoplayMasteryBias = this.getAutoplayMasteryBias();

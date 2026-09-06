@@ -1,0 +1,8 @@
+{
+  "name": "civ7-izica-dev-panel-fixed",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node tests/run.mjs"
+  }
+}
