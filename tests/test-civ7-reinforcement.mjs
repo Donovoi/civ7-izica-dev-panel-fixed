@@ -196,6 +196,7 @@ async function integration(options={}) {
         DirectionTypes:Object.fromEntries(['EAST','NORTHEAST','NORTHWEST','WEST','SOUTHWEST','SOUTHEAST'].map((d,i)=>['DIRECTION_'+d,i]))});
     const stubs={
         '/core/ui/context-manager/context-manager.js':{default:{}},'/core/ui/interface-modes/interface-modes.js':{InterfaceMode:{}},
+        '/core/ui-next/services/focus-manager.js':{FocusManager:{get:()=>({setFocus(){}})}},
         '/core/ui/utilities/utilities-component-id.js':{ComponentID:{isValid:i=>i?.id>=0,isMatch:equalId}},
         './storage.js':{Storage:{get:()=>null,set(){}}},'./console.js':{Console:{}},'./logs.js':{Logs:{}},
         './attribute-spending.js':{AttributeSpending:{}},'./building-automation.js':{BuildingAutomation:{}},

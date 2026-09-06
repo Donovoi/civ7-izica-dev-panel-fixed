@@ -2,9 +2,9 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 let total = 0;
-for (const suite of ['attributes', 'buildings', 'reinforcement']) {
+for (const suite of ['attributes', 'buildings', 'reinforcement', 'commanders']) {
     const script = fileURLToPath(new URL(`./test-civ7-${suite}.mjs`, import.meta.url));
-    const args = suite === 'reinforcement' ? ['--experimental-vm-modules', script] : [script];
+    const args = ['reinforcement', 'commanders'].includes(suite) ? ['--experimental-vm-modules', script] : [script];
     const result = spawnSync(process.execPath, args, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
     if (result.status !== 0 || result.error) {
         console.error(result.error ?? result.stderr);
