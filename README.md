@@ -2,7 +2,7 @@
 
 This working copy includes the original dev/cheat panel and these additions:
 
-- **Spend all attribute points:** completes available non-repeatable upgrades first, then balances repeatable bonuses across branches until no more points can be spent. Click again to stop.
+- **Spend all attribute points:** completes available non-repeatable upgrades first, then balances repeatable bonuses across branches until no more points can be spent. Up to six different repeatable nodes can be purchased together, with points reserved for every pending request. Click again to stop.
 - **Build all buildings + wonders:** purchases or instantly completes available buildings across settlements, prioritizing urgent needs, unique quarters, advisor recommendations, and yields before remaining buildings and wonders. Placement uses the game's legal plots and protects available wonder space. Click again to stop.
 - **Grow all cities:** adds population one growth step at a time, fills legal rural tiles, then fills available specialist slots. It rechecks every settlement until the game reports no further slots, including capacity unlocked during growth. Existing pending population is placed first, and tiles belonging to another settlement are excluded. Click again to stop; uncertain requests are checked before resuming.
 - **Reinforce all:** temporarily enables infinite movement, walks eligible soldiers to compatible commanders with space, and packs them using the game's commands. Each movement/assignment is confirmed before continuing. Native reinforcement travel is a fallback when walking is unavailable. The previous infinite-movement setting is restored after the sweep.
@@ -24,7 +24,13 @@ The panel retains the original keyboard bindings. Its existing recovery shortcut
 
 ## Validation
 
-The current changes passed 222 offline checks: 29 attribute, 42 building, 37 reinforcement, 45 commander, and 69 growth tests. Native API usage was compared with the locally installed game's UI modules and definitions. These checks simulate game responses; successful execution in a live save has not yet been verified. Real commander capacity, terrain, unit domains, building eligibility, and placement rules still apply. Native reinforcement fallback retains the game's travel timer.
+The current changes passed 259 offline checks: 46 attribute, 46 building, 37 reinforcement, 45 commander, and 85 growth tests. Native API usage was compared with the locally installed game's UI modules and definitions. These checks simulate game responses; successful execution in a live save has not yet been verified. Real commander capacity, terrain, unit domains, building eligibility, and placement rules still apply. Native reinforcement fallback retains the game's travel timer.
+
+Attribute spending reacts immediately to game confirmation events instead of waiting for the next poll. Finite upgrades remain sequential so prerequisites settle before proceeding. Repeatable batches reserve dedicated and wildcard points, preserve branch balancing, and wait for every requested node and the full point cost to be confirmed. Unconfirmed purchases remain reserved across Stop/resume. Each callback yields after 32 requests or a 4 ms work budget checked between operations.
+
+An offline comparison against commit `a53ee5c`, with the same simulated 40 ms game response per purchase, spent 6,000 wildcard points in 41.88 seconds instead of 750.025 seconds. Final allocations were identical. This measures controller scheduling with simulated responses; actual game speed still needs a live measurement. The installed native attribute operation accepts one node per request and exposes no bulk quantity parameter.
+
+City growth and building planning process up to eight settlements per callback, yielding between settlements when their 4 ms work budget is reached. Growth allows one pending operation per city and reserves pending expansion tiles across cities, including unconfirmed requests retained after Stop or timeout. Building purchases and production remain sequential because gold, wonder availability, and placement can change after each action. Commander promotions and reinforcement retain their existing ordering because selection and army capacity are shared state.
 
 The tests use Node.js (validated with Node 24) and Python 3's standard library. No npm dependencies are required. First generate attribute test data from your own game installation; generated game data is ignored by Git:
 

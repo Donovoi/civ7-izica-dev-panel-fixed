@@ -11,6 +11,8 @@ class Clock {
     time = 0;
     sequence = 0;
     tasks = new Map();
+    currentTask = null;
+    executed = 0;
     schedule = (fn, delay) => {
         const id = ++this.sequence;
         this.tasks.set(id, { fn, due: this.time + delay });
@@ -21,8 +23,9 @@ class Clock {
         const next = [...this.tasks.entries()].sort((a, b) => a[1].due - b[1].due || a[0] - b[0])[0];
         if (!next) return false;
         this.tasks.delete(next[0]);
-        this.time = next[1].due;
-        next[1].fn();
+        this.time = Math.max(this.time, next[1].due);
+        this.currentTask = next[0]; this.executed++;
+        try { next[1].fn(); } finally { this.currentTask = null; }
         return true;
     }
     drain(limit = 25000) {
@@ -42,6 +45,10 @@ function setup(options = {}) {
     const dedicated = attributes.map((_, i) => options.dedicated?.[i] ?? 0);
     const listeners = new Map();
     const history = [];
+    const confirmationHistory = [];
+    const pendingNative = new Map();
+    const pendingCostByBranch = attributes.map(() => 0);
+    let attempts = 0;
     const traits = options.traits ?? ['TRAIT_LEADER_AUGUSTUS_ABILITY'];
     const states = new Map();
     const types = new Map();
@@ -59,6 +66,7 @@ function setup(options = {}) {
     }
     for (const type of options.precompleted ?? []) types.get(type).depthUnlocked = 1;
     const events = (event, player = game.GameContext.localPlayerID) => {
+        if (options.silentEvents) return;
         for (const fn of [...(listeners.get(event) ?? [])]) fn({ player });
     };
     const prereqs = node => fixture.prereqs.filter(p => p.Node === node.def.ProgressionTreeNodeType).map(p => types.get(p.PrereqNode));
@@ -80,7 +88,7 @@ function setup(options = {}) {
             ProgressionTreeNodes: { lookup: id => states.get(id)?.def },
         },
         Players: { get: id => id === 0 ? { Identity: {
-            getWildcardPoints: () => wildcard,
+            getWildcardPoints: () => { clock.time += options.snapshotWorkMs ?? 0; return wildcard; },
             getAvailableAttributePoints: type => dedicated[attributes.findIndex(a => a.AttributeType === type)],
         } } : null },
         engine: {
@@ -112,48 +120,68 @@ function setup(options = {}) {
                     assert.equal(operation, 'BUY_ATTRIBUTE_TREE_NODE');
                     const node = states.get(args.ProgressionTreeNodeType);
                     assert(canBuy(node), 'sent an illegal purchase');
-                    if (options.reject) return false;
+                    attempts++;
+                    if (options.reject || options.rejectAt === attempts) return false;
+                    assert(!pendingNative.has(node.id), 'a node was requested again before its previous node and point updates both confirmed');
+                    const cost = Number(node.def.Cost);
+                    pendingCostByBranch[node.branch] += cost;
+                    assert(pendingCostByBranch.reduce((sum, owed, branch) => sum + Math.max(0, owed - dedicated[branch]), 0) <= wildcard,
+                        'accepted purchases over-reserved shared wildcard or dedicated points');
+                    const pending = { nodeDone: false, pointDone: false, cost };
+                    pendingNative.set(node.id, pending);
+                    const settle = () => {
+                        if (pending.nodeDone && pending.pointDone) { pendingNative.delete(node.id); inflight--; }
+                    };
                     history.push({ id: node.id, type: node.def.ProgressionTreeNodeType,
                         repeatable: node.repeatable, branch: node.branch, total: total(),
+                        at: clock.time, pump: clock.currentTask,
                         unfinished: [...states.values()].filter(n => n.eligible && !n.repeatable && n.depthUnlocked < n.maxDepth).length });
                     inflight++;
                     maxInflight = Math.max(maxInflight, inflight);
-                    if (options.drop) return;
+                    if (options.drop || options.dropNodes?.includes(node.def.ProgressionTreeNodeType)) return;
                     const apply = () => {
-                        if (!options.noNodeProgress) {
+                        if (!options.noNodeProgress && !options.noNodeProgressNodes?.includes(node.def.ProgressionTreeNodeType)) {
                             if (node.repeatable) node.repeatedDepth++;
                             else node.depthUnlocked++;
+                            pending.nodeDone = true;
+                            confirmationHistory.push({ kind: 'node', id: node.id, at: clock.time });
                         }
-                        inflight--;
                         events('AttributeNodeCompleted', 0);
                         const deduct = () => {
-                            if (!options.free) {
-                                const cost = Number(node.def.Cost);
+                            if (!options.free && !options.freeNodes?.includes(node.def.ProgressionTreeNodeType)) {
                                 const own = Math.min(cost, dedicated[node.branch]);
                                 dedicated[node.branch] -= own;
                                 wildcard -= cost - own;
+                                assert(wildcard >= 0 && dedicated.every(points => points >= 0), 'native point pools became negative');
+                                pendingCostByBranch[node.branch] -= cost;
+                                pending.pointDone = true;
+                                confirmationHistory.push({ kind: 'points', id: node.id, at: clock.time });
                             }
+                            settle();
                             events('AttributePointsChanged', 0);
                         };
-                        if (options.pointDelay) clock.schedule(deduct, options.pointDelay);
+                        const pointDelay = typeof options.pointDelay === 'function' ? options.pointDelay(node, history.length) : options.pointDelay;
+                        if (pointDelay) clock.schedule(deduct, pointDelay);
                         else deduct();
                     };
-                    if (options.delay === 0) apply();
-                    else clock.schedule(apply, options.delay ?? 10);
-                    if (options.throwAfterAccept) throw new Error('simulated send error after acceptance');
+                    const delay = typeof options.delay === 'function' ? options.delay(node, history.length) : options.delay;
+                    if (delay === 0) apply();
+                    else clock.schedule(apply, delay ?? 10);
+                    if (options.throwAfterAccept || options.throwAfterAcceptAt === attempts) throw new Error('simulated send error after acceptance');
                 },
             },
         },
     };
     const status = [];
     const controller = new AttributeSpendingController(() => createGameAttributeRuntime(game), {
-        schedule: clock.schedule, unschedule: clock.unschedule, now: () => clock.time,
+        schedule: clock.schedule, unschedule: clock.unschedule, now: () => { clock.time += options.nowStep ?? 0; return clock.time; },
         render: state => status.push({ ...state }),
     });
-    return { game, clock, controller, history, states, types, events, total, dedicated, status,
+    return { game, clock, controller, history, states, types, events, total, dedicated, status, confirmationHistory, pendingNative,
         levels: () => [...states.values()].filter(n => n.repeatable).map(n => n.depthUnlocked + n.repeatedDepth),
         listeners: () => [...listeners.values()].reduce((sum, set) => sum + set.size, 0),
-        maxInflight: () => maxInflight };
+        maxInflight: () => maxInflight, attempts: () => attempts, wildcard: () => wildcard,
+        maxRequestsPerPump: () => { const counts = new Map(); for (const item of history) counts.set(item.pump, (counts.get(item.pump) ?? 0) + 1); return Math.max(0, ...counts.values()); } };
 }
 
 function run(name, body) {
@@ -166,7 +194,8 @@ function complete(sim) {
     assert.equal(sim.controller.running, false);
     assert.equal(sim.listeners(), 0);
     assert.equal(sim.clock.tasks.size, 0);
-    assert(sim.maxInflight() <= 1, 'duplicate requests were in flight');
+    assert(sim.maxInflight() <= 6, 'more than six independent nodes were in flight');
+    assert(sim.maxRequestsPerPump() <= 32, 'a single UI pump submitted more than 32 requests');
 }
 
 run('1000 wildcard points: complete all finite nodes before balanced repeats', () => {
@@ -301,7 +330,8 @@ run('A spent point without the requested node progress cannot confirm', () => {
 });
 run('A free repeatable upgrade is bounded rather than looping forever', () => {
     const s = setup({ wildcard: 3, finished: true, free: true }); complete(s);
-    assert.equal(s.history.length, 1); assert.match(s.controller.message, /did not confirm/);
+    assert(s.history.length >= 1 && s.history.length <= 3); assert.equal(new Set(s.history.map(h => h.id)).size, s.history.length);
+    assert.equal(s.controller.purchases, 0); assert.match(s.controller.message, /did not confirm/);
 });
 run('Unavailable API and invalid point data surface visible failures', () => {
     const s = setup({ wildcard: 5 }); delete s.game.PlayerOperationTypes.BUY_ATTRIBUTE_TREE_NODE;
@@ -317,6 +347,110 @@ run('Multi-depth finite nodes are completed before repeatable spending', () => {
     const s = setup({ wildcard: 100 }); s.types.get('NODE_ATTRIBUTE_CULTURAL_01').maxDepth = 3;
     complete(s); assert.equal(s.history.filter(h => h.type === 'NODE_ATTRIBUTE_CULTURAL_01').length, 3);
     assert(s.history.filter(h => h.repeatable).every(h => h.unfinished === 0));
+});
+run('6000 wildcard points preserve finite branch order and finish balanced repeats promptly', () => {
+    const s = setup({ wildcard: 6000, delay: 40 }); complete(s);
+    assert.equal(s.total(), 0); assert.equal(s.controller.purchases, 6000); assert.equal(s.history.length, 6000);
+    assert(s.history.filter(h => h.repeatable).every(h => h.unfinished === 0));
+    const finiteBranches = s.history.filter(h => !h.repeatable).map(h => h.branch).filter((branch,index,all) => index === 0 || branch !== all[index-1]);
+    assert.deepEqual(finiteBranches, [0,1,2,3,4,5]); assert(Math.max(...s.levels()) - Math.min(...s.levels()) <= 1);
+    assert.equal(s.maxInflight(), 6); assert(s.clock.time <= 60000, '6000-point simulator run still pays a serial poll delay per point');
+    return { purchases: 6000, simulatedGameConfirmationMs: 40, simulatedElapsedMs: s.clock.time, maxInflight: s.maxInflight(), finalRepeatLevels: s.levels() };
+});
+run('6000 dedicated points use all six independent repeatables without overspending any pool', () => {
+    const s = setup({ dedicated: [1000,1000,1000,1000,1000,1000], finished: true, delay: 40 }); complete(s);
+    assert.equal(s.total(), 0); assert.equal(s.wildcard(), 0); assert.equal(s.controller.purchases, 6000); assert.deepEqual(s.levels(), [1000,1000,1000,1000,1000,1000]);
+    assert.equal(s.maxInflight(), 6); assert(s.clock.time <= 50000);
+    return { purchases: 6000, simulatedGameConfirmationMs: 40, simulatedElapsedMs: s.clock.time, maxInflight: s.maxInflight() };
+});
+run('Inline 6000-point spending yields after at most 32 new requests in each UI pump', () => {
+    const s = setup({ wildcard: 6000, finished: true, delay: 0 }); complete(s);
+    assert.equal(s.total(), 0); assert.equal(s.controller.purchases, 6000); assert(s.maxRequestsPerPump() > 6, 'inline confirmations still incur one task per tiny batch');
+    assert(s.maxRequestsPerPump() <= 32); assert(s.clock.executed >= Math.ceil(6000/32));
+    return { purchases: 6000, maxRequestsPerPump: s.maxRequestsPerPump(), scheduledTasks: s.clock.executed };
+});
+run('The UI time budget yields early when native checks consume the current task budget', () => {
+    const s = setup({ wildcard: 120, finished: true, delay: 0, nowStep: 1 }); complete(s);
+    assert.equal(s.total(), 0); assert.equal(s.controller.purchases, 120); assert(s.maxRequestsPerPump() < 32, 'elapsed work budget was ignored');
+    assert(s.clock.executed > Math.ceil(120/32));
+    return { maxRequestsPerPump: s.maxRequestsPerPump(), scheduledTasks: s.clock.executed };
+});
+run('A snapshot taking longer than the UI work budget still permits bounded forward progress', () => {
+    const s = setup({ wildcard: 18, finished: true, delay: 0, snapshotWorkMs: 6 }); complete(s);
+    assert.equal(s.history.length, 18); assert.equal(s.controller.purchases, 18); assert.equal(s.total(), 0);
+    assert.equal(s.maxRequestsPerPump(), 1); assert(s.clock.executed >= 18);
+});
+run('Attribute events preempt a slow fallback poll for the next independent batch', () => {
+    const s = setup({ wildcard: 12, finished: true, delay: 40 }); complete(s);
+    assert.equal(s.history.length, 12); assert.equal(s.maxInflight(), 6);
+    assert(s.history[6].at - s.history[0].at <= 50, 'ready events remained behind the 100ms fallback poll');
+});
+run('Lost events still confirm six pending nodes by polling without duplicate requests', () => {
+    const s = setup({ wildcard: 18, finished: true, delay: 250, silentEvents: true }); complete(s);
+    assert.equal(s.total(), 0); assert.equal(s.controller.purchases, 18); assert.equal(s.maxInflight(), 6);
+});
+run('Pending purchases reserve scarce dedicated and shared wildcard points before dispatch', () => {
+    const s = setup({ wildcard: 1, dedicated: [1,0,0,0,0,0], finished: true, delay: 0, pointDelay: 500 });
+    s.controller.start(); s.clock.next(); assert.equal(s.history.length, 2); assert.equal(s.total(), 2); assert.equal(s.controller.purchases, 0);
+    s.clock.advance(400); assert.equal(s.history.length, 2); assert.equal(s.controller.purchases, 0);
+    s.clock.drain(); assert.equal(s.total(), 0); assert.equal(s.history.length, 2); assert.equal(s.controller.purchases, 2); assert.equal(s.listeners(), 0);
+});
+run('Different node and pool update times require proof for the entire reserved batch', () => {
+    const s = setup({ wildcard: 12, finished: true, delay: 0, pointDelay: node => node.branch === 0 ? 500 : 100 });
+    s.controller.start(); s.clock.next(); assert.equal(s.history.length, 6); s.clock.advance(400);
+    assert.equal(s.history.length, 6); assert.equal(s.controller.purchases, 0); assert.equal(s.total(), 7);
+    s.clock.drain(); assert.equal(s.total(), 0); assert.equal(s.history.length, 12); assert.equal(s.controller.purchases, 12); assert.equal(s.maxInflight(), 6);
+});
+run('Multi-point node costs reserve the actual shared budget and require the full cost debit', () => {
+    const s = setup({ wildcard: 11, dedicated: [1,0,0,0,0,0], finished: true, delay: 0,
+        pointDelay: node => node.branch < 3 ? 100 : 500 });
+    for (const node of s.states.values()) if (node.repeatable) node.def.Cost = '2';
+    s.controller.start(); s.clock.next(); assert.equal(s.history.length, 6); s.clock.advance(200);
+    assert.equal(s.total(), 6); assert.equal(s.controller.purchases, 0); assert.equal(s.history.length, 6);
+    s.clock.drain(); assert.equal(s.total(), 0); assert.equal(s.controller.purchases, 6); assert.equal(s.history.length, 6);
+    assert(s.dedicated.every(points => points === 0)); assert.equal(s.wildcard(), 0); assert.equal(s.maxInflight(), 6); assert.equal(s.listeners(), 0);
+});
+run('Out-of-order confirmations preserve virtual balancing and never skip ahead of a busy low branch', () => {
+    const s = setup({ wildcard: 60, finished: true, levels: [10,0,0,0,0,0], delay: node => node.branch === 1 ? 500 : 40 });
+    s.controller.start(); s.clock.advance(200); assert(s.history.length >= 2); assert(s.history.every(item => item.branch !== 0));
+    s.clock.drain(); assert.equal(s.total(), 0); assert(Math.max(...s.levels()) - Math.min(...s.levels()) <= 1); assert(s.maxInflight() <= 6);
+});
+run('A shared point debit cannot confirm a free node in an otherwise successful batch', () => {
+    const options = { wildcard: 6, finished: true, freeNodes: [] }; const s = setup(options);
+    options.freeNodes.push([...s.states.values()].find(node => node.repeatable && node.branch === 0).def.ProgressionTreeNodeType);
+    complete(s); assert.equal(s.history.length, 6); assert.equal(s.total(), 1); assert.equal(s.controller.purchases, 0); assert.match(s.controller.message, /did not confirm/);
+    s.controller.start(); s.clock.drain(); assert.equal(s.history.length, 6); assert.equal(s.controller.running, false);
+});
+run('Other nodes completing cannot confirm one node that spent its point without progressing', () => {
+    const options = { wildcard: 6, finished: true, noNodeProgressNodes: [] }; const s = setup(options);
+    options.noNodeProgressNodes.push([...s.states.values()].find(node => node.repeatable && node.branch === 0).def.ProgressionTreeNodeType);
+    complete(s); assert.equal(s.history.length, 6); assert.equal(s.total(), 0); assert.equal(s.controller.purchases, 0); assert.match(s.controller.message, /did not confirm/);
+    s.controller.start(); s.clock.drain(); assert.equal(s.history.length, 6); assert.equal(s.controller.running, false);
+});
+run('Stopping and resuming six pending requests never overtakes their partial confirmations', () => {
+    const s = setup({ wildcard: 12, finished: true, delay: node => node.branch === 5 ? 600 : 40 });
+    s.controller.start(); s.clock.next(); assert.equal(s.history.length, 6); s.clock.advance(100); s.controller.toggle(); s.controller.start();
+    assert.equal(s.controller.running, false); assert.equal(s.history.length, 6); assert.equal(s.listeners(), 0);
+    s.clock.drain(); assert.equal(s.total(), 6); complete(s); assert.equal(s.total(), 0); assert.equal(s.history.length, 12);
+});
+run('A partial batch rejection preserves accepted requests and permits a later explicit restart', () => {
+    const s = setup({ wildcard: 12, finished: true, delay: 500, rejectAt: 4 }); s.controller.start(); s.clock.next();
+    assert.equal(s.controller.running, false); assert.equal(s.history.length, 3); assert.match(s.controller.message, /rejected/);
+    s.controller.start(); assert.equal(s.controller.running, false); assert.equal(s.history.length, 3);
+    s.clock.drain(); assert.equal(s.total(), 9); assert.equal(s.history.length, 3);
+    complete(s); assert.equal(s.total(), 0); assert.equal(s.history.length, 12); assert.equal(s.controller.purchases, 9);
+});
+run('An exception after partial batch acceptance cannot resubmit its uncertain node', () => {
+    const s = setup({ wildcard: 12, finished: true, delay: 500, throwAfterAcceptAt: 3 }); s.controller.start(); s.clock.next();
+    assert.equal(s.controller.running, false); assert.equal(s.history.length, 3);
+    s.controller.start(); assert.equal(s.controller.running, false); assert.equal(s.history.length, 3);
+    s.clock.drain(); assert.equal(s.total(), 9); assert.equal(s.history.length, 3);
+    complete(s); assert.equal(s.total(), 0); assert.equal(s.history.length, 12); assert.equal(s.controller.purchases, 9);
+});
+run('A local-player change stops an independent batch without submitting follow-up purchases', () => {
+    const s = setup({ wildcard: 12, finished: true, delay: 500 }); s.controller.start(); s.clock.next(); assert.equal(s.history.length, 6);
+    s.game.GameContext.localPlayerID = 1; s.events('LocalPlayerChanged', 1); s.clock.drain();
+    assert.equal(s.history.length, 6); assert.equal(s.controller.running, false); assert.equal(s.listeners(), 0);
 });
 run('Panel selectors and action mapping reach the new singleton', () => {
     const html = fs.readFileSync(new URL('../ui/dev-panel.html', import.meta.url), 'utf8');

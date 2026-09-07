@@ -375,6 +375,50 @@ test('A missing instant-completion helper uses purchases and reports remaining p
     delete s.cities[0].BuildQueue.completeProduction;run(s);assert.equal(s.controller.count,1);
     assert.equal(purchased(s)[0].operation,'purchase');assert.match(s.controller.message,/instant production is unavailable/);
 });
+
+test('Large empire planning scans eight settlements per tick and renders once per batch',()=>{
+    const s=setup([],Array.from({length:25},(_,i)=>({id:10+i})));
+    const runtime=createGameBuildingRuntime(s.g),inspect=runtime.inspect;let scans=0;
+    runtime.inspect=(...args)=>{scans++;return inspect(...args);};s.controller.runtimeFactory=()=>runtime;
+    s.controller.start();
+    for(const expected of [8,16,24,25]){
+        assert(s.clock.next());assert.equal(scans,expected);assert.equal(purchased(s).length,0);
+    }
+    assert.equal(s.rendered.filter(r=>r.message.includes('Planning settlement')).length,4);
+    s.clock.drain();assert.equal(s.controller.running,false);assert.equal(s.listeners(),0);
+    assert.equal(s.clock.time,125,'25 fast city inspections should require four planning ticks plus finalization');
+});
+
+test('Planning yields after its time budget even before the eight-city limit',()=>{
+    const s=setup([],Array.from({length:10},(_,i)=>({id:10+i})));
+    const runtime=createGameBuildingRuntime(s.g),inspect=runtime.inspect;let scans=0;
+    runtime.inspect=(...args)=>{scans++;const result=inspect(...args);s.clock.time+=3;return result;};
+    s.controller.runtimeFactory=()=>runtime;s.controller.start();
+    assert(s.clock.next());assert.equal(scans,2);
+    assert.equal(s.rendered.filter(r=>r.message.includes('Planning settlement')).length,1);
+    assert(s.clock.next());assert.equal(scans,4);
+    assert.equal(purchased(s).length,0);s.clock.drain();assert.equal(scans,10);
+    assert.equal(s.controller.running,false);assert.equal(s.listeners(),0);
+});
+
+test('Stop during a planning batch prevents further inspections and submissions',()=>{
+    const s=setup([{type:'MARKET',plots:[1]}],Array.from({length:12},(_,i)=>({id:10+i})));
+    const runtime=createGameBuildingRuntime(s.g),inspect=runtime.inspect;let scans=0;
+    runtime.inspect=(...args)=>{scans++;const result=inspect(...args);s.controller.toggle();return result;};
+    s.controller.runtimeFactory=()=>runtime;s.controller.start();s.clock.drain();
+    assert.equal(scans,1);assert.equal(purchased(s).length,0);assert.equal(s.controller.running,false);
+    assert.equal(s.listeners(),0);assert.equal(s.clock.tasks.size,0);assert.match(s.controller.message,/Stopped/);
+    assert(!s.rendered.at(-1).message.includes('Planning settlement'));
+});
+
+test('A local-player change inside planning stops the batch before any submission',()=>{
+    const s=setup([{type:'MARKET',plots:[1]}],Array.from({length:12},(_,i)=>({id:10+i})));
+    const runtime=createGameBuildingRuntime(s.g),inspect=runtime.inspect;let scans=0;
+    runtime.inspect=(...args)=>{scans++;const result=inspect(...args);s.g.GameContext.localPlayerID=1;return result;};
+    s.controller.runtimeFactory=()=>runtime;s.controller.start();s.clock.drain();
+    assert.equal(scans,1);assert.equal(purchased(s).length,0);assert.equal(s.controller.running,false);
+    assert.equal(s.listeners(),0);assert.equal(s.clock.tasks.size,0);assert.match(s.controller.message,/local player changed/i);
+});
 const result={passed:tests.filter(t=>t.passed).length,failed:tests.filter(t=>!t.passed).length,tests};
 fs.writeFileSync(new URL('./civ7-building-tests.json',import.meta.url),JSON.stringify(result,null,2)+'\n');
 console.log(JSON.stringify(result,null,2));process.exitCode=result.failed?1:0;

@@ -260,6 +260,25 @@ test('Empty expansion Plots with pending growth provides a confirmed empty rural
     assert.equal(s.runtime.grant(s.city.id, 0), false); assert.equal(s.food, 0);
 });
 
+test('Native runtime rejects requests after the local player changes despite retained settlement ownership', () => {
+    const s = setup(); const candidate = s.inspect().candidates[0]; s.g.GameContext.localPlayerID = 1;
+    assert.throws(() => s.runtime.grant(s.city.id, 0), /no longer owned/);
+    assert.throws(() => s.runtime.place(s.city.id, candidate, 0), /no longer owned/);
+    assert.equal(s.food, 0); assert.deepEqual(s.sent(), []);
+});
+
+test('A player change during final native availability checking prevents the placement send', () => {
+    const s = setup(); s.ready(); const candidate = s.inspect().candidates[0];
+    const check = s.g.Game.CityCommands.canStart;
+    s.g.Game.CityCommands.canStart = (...args) => {
+        const result = check(...args);
+        if (Object.keys(args[2]).length) s.g.GameContext.localPlayerID = 1;
+        return result;
+    };
+    assert.throws(() => s.runtime.place(s.city.id, candidate, 0), /no longer owned/);
+    assert.deepEqual(s.sent(), []);
+});
+
 const result = { passed: tests.filter(t => t.passed).length, failed: tests.filter(t => !t.passed).length, tests };
 console.log(JSON.stringify(result, null, 2));
 process.exitCode = result.failed ? 1 : 0;

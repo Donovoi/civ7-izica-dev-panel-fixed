@@ -2,6 +2,8 @@
 // interface-mode-acquire-tile.js, plot-workers-manager.js, and Cities.ltp.
 const STEP_MS = 25;
 const POLL_MS = 100;
+const CITIES_PER_TICK = 8;
+const TICK_BUDGET_MS = 4;
 const TIMEOUT_MS = 10000;
 const MAX_PLACEMENTS = 50000; // A runaway guard, never reported as a population cap.
 const key = id => `${id.owner}:${id.id}:${id.type}`;
@@ -16,7 +18,7 @@ const delta = (before, after) => ({
 export function createGameCityGrowthRuntime(g) {
     const cityFor = (id, playerId) => {
         const city = g.Cities.get(id);
-        if (!city || city.owner !== playerId || id.owner !== playerId || !sameCity(city.id, id)) {
+        if (g.GameContext.localPlayerID !== playerId || !city || city.owner !== playerId || id.owner !== playerId || !sameCity(city.id, id)) {
             throw new Error("Settlement is no longer owned by the local player.");
         }
         return city;
@@ -109,6 +111,7 @@ export function createGameCityGrowthRuntime(g) {
             const type = rural ? g.CityCommandTypes.EXPAND : g.PlayerOperationTypes.ASSIGN_WORKER;
             const args = rural ? expandArgs(current) : workerArgs(current);
             if (api.canStart(target, type, args, false)?.Success !== true) return false;
+            cityFor(id, playerId);
             if (api.sendRequest(target, type, args) === false) throw new Error("The population placement request was rejected.");
             return true;
         },
@@ -124,6 +127,7 @@ export class CityGrowthController {
         this.runtime = null;
         this.running = false;
         this.timer = null;
+        this.timerDue = null;
         this.listeners = [];
         this.pending = new Map();
         this.blocked = new Map();
@@ -163,7 +167,7 @@ export class CityGrowthController {
         } catch (error) { this.finish(`Stopped: ${error.message ?? error}`); }
     }
     beginPass() {
-        this.cityIds = this.runtime.cityIds(this.playerId);
+        this.cityIds = [...new Map(this.runtime.cityIds(this.playerId).map(id => [key(id), id])).values()];
         const present = new Set(this.cityIds.map(key));
         for (const [cityKey, p] of this.pending) {
             if (!present.has(cityKey)) this.blocked.set(cityKey, `${p.name}: settlement is no longer available; its request remains unconfirmed`);
@@ -174,8 +178,14 @@ export class CityGrowthController {
         this.unplaced = new Set();
     }
     queue(delay) {
-        if (!this.running || this.timer !== null) return;
-        this.timer = this.schedule(() => { this.timer = null; this.step(); }, delay);
+        if (!this.running) return;
+        const due = this.now() + delay;
+        if (this.timer !== null) {
+            if (this.timerDue <= due) return;
+            this.unschedule(this.timer);
+        }
+        this.timerDue = due;
+        this.timer = this.schedule(() => { this.timer = null; this.timerDue = null; this.step(); }, delay);
     }
     credit(before, after) {
         const added = delta(before, after);
@@ -188,6 +198,11 @@ export class CityGrowthController {
         if (this.blocked.has(cityKey)) return;
         try {
             const state = this.runtime.inspect(id, this.playerId);
+            if (!this.running) return;
+            if (this.runtime.localPlayerId() !== this.playerId) {
+                this.finish("Stopped because the local player changed.");
+                return;
+            }
             const p = this.pending.get(cityKey);
             if (p) {
                 const added = delta(p.before, state);
@@ -220,8 +235,22 @@ export class CityGrowthController {
                 return;
             }
             const rejected = this.rejectedCandidates.get(cityKey) ?? new Set();
-            const candidate = state.candidates.find(c => !rejected.has(`${c.kind}:${c.plot}`));
+            // Two settlements can expose the same unclaimed border tile.
+            // Keep every other city's pending placement reserved, including
+            // uncertain requests retained after Stop or a timeout.
+            const reservations = new Map([...this.pending]
+                .filter(([otherKey, request]) => otherKey !== cityKey && request.kind === "placement" && request.candidate)
+                .map(([otherKey, request]) => [request.candidate.plot, otherKey]));
+            const legalCandidates = state.candidates.filter(c => !rejected.has(`${c.kind}:${c.plot}`));
+            const candidate = legalCandidates.find(c => !reservations.has(c.plot));
             if (!candidate && state.candidates.length) {
+                const waiting = legalCandidates.filter(c => reservations.has(c.plot));
+                if (waiting.length) {
+                    if (waiting.every(c => this.blocked.has(reservations.get(c.plot)))) {
+                        this.blocked.set(cityKey, `${state.name}: waiting for unconfirmed expansion in another settlement`);
+                    }
+                    return;
+                }
                 this.blocked.set(cityKey, `${state.name}: the game rejected all remaining growth placements`);
                 return;
             }
@@ -245,7 +274,7 @@ export class CityGrowthController {
                 if (kind === "grant" && failures >= 3) this.blocked.set(cityKey, `${state.name}: the game rejected population growth`);
             }
             this.passProgress = true;
-            this.status(`${state.name}; ${this.totals()}. Click again to stop.`);
+            if (this.running) this.status(`${state.name}; ${this.totals()}. Click again to stop.`);
         } catch (error) {
             // Keep uncertain requests across Stop/Start, but let other cities grow.
             this.blocked.set(cityKey, `${error.message ?? error}`);
@@ -254,12 +283,27 @@ export class CityGrowthController {
     step() {
         if (!this.running) return;
         try {
+            const started = this.now();
+            let processed = 0;
+            // Every city keeps its own pending proof. A bounded batch lets
+            // independent settlements progress together without issuing two
+            // operations to the same city or monopolizing the UI thread.
+            while (this.index < this.cityIds.length && processed < CITIES_PER_TICK
+                && (processed === 0 || this.now() - started < TICK_BUDGET_MS)) {
+                if (!this.running) return;
+                if (this.runtime.localPlayerId() !== this.playerId) throw new Error("The local player changed.");
+                if (this.count.rural + this.count.specialists >= MAX_PLACEMENTS) {
+                    throw new Error("Growth stopped at the operation guard. Remaining capacity has not been exhausted.");
+                }
+                this.advanceCity(this.cityIds[this.index++]);
+                processed++;
+            }
+            if (!this.running) return;
             if (this.runtime.localPlayerId() !== this.playerId) throw new Error("The local player changed.");
             if (this.count.rural + this.count.specialists >= MAX_PLACEMENTS) {
                 throw new Error("Growth stopped at the operation guard. Remaining capacity has not been exhausted.");
             }
             if (this.index < this.cityIds.length) {
-                this.advanceCity(this.cityIds[this.index++]);
                 this.queue(STEP_MS);
                 return;
             }
@@ -281,6 +325,7 @@ export class CityGrowthController {
         this.running = false;
         if (this.timer !== null) this.unschedule(this.timer);
         this.timer = null;
+        this.timerDue = null;
         for (const [event, callback] of this.listeners) this.runtime.off(event, callback);
         this.listeners = [];
         this.status(message);

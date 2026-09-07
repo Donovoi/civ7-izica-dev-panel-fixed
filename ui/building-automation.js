@@ -3,6 +3,8 @@
 const STEP_MS = 25;
 const POLL_MS = 100;
 const TIMEOUT_MS = 10000;
+const SCAN_BATCH_SIZE = 8;
+const SCAN_BUDGET_MS = 4;
 const WEIGHTS = { YIELD_PRODUCTION: 3, YIELD_FOOD: 2, YIELD_HAPPINESS: 2,
     YIELD_GOLD: 1.5, YIELD_SCIENCE: 2, YIELD_CULTURE: 2, YIELD_DIPLOMACY: 1.5 };
 const trueValue = value => value === true || value === 1 || value === "true" || value === "1";
@@ -354,12 +356,23 @@ export class BuildingAutomationController {
         try {
             if (this.runtime.localPlayerId() !== this.playerId) throw new Error("The local player changed.");
             if (this.pending) { this.processPending(); return; }
-            // Spread empire-wide placement calculations over UI ticks so Stop
-            // remains responsive even in a large empire.
+            // Batch read-only planning, yielding after eight cities or 4 ms.
+            // Purchases and production still share one confirmed request at a
+            // time because they compete for gold, wonder sites, and queue heads.
             if (this.scanIndex < this.cityIds.length) {
-                const snapshot = this.runtime.inspect(this.cityIds[this.scanIndex++], this.playerId, this.done);
-                this.candidates.push(...snapshot.candidates);
-                for (const key of Object.keys(this.blocked)) this.blocked[key] += snapshot.blocked[key];
+                const startedAt = this.now();
+                let scanned = 0;
+                while (this.scanIndex < this.cityIds.length && scanned < SCAN_BATCH_SIZE
+                    && (scanned === 0 || this.now() - startedAt < SCAN_BUDGET_MS)) {
+                    if (!this.running) return;
+                    if (this.runtime.localPlayerId() !== this.playerId) throw new Error("The local player changed.");
+                    const snapshot = this.runtime.inspect(this.cityIds[this.scanIndex++], this.playerId, this.done);
+                    if (!this.running) return;
+                    if (this.runtime.localPlayerId() !== this.playerId) throw new Error("The local player changed.");
+                    this.candidates.push(...snapshot.candidates);
+                    for (const key of Object.keys(this.blocked)) this.blocked[key] += snapshot.blocked[key];
+                    scanned++;
+                }
                 this.status(`Planning settlement ${this.scanIndex}/${this.cityIds.length}; ${this.count} completed.`);
                 this.queue(STEP_MS);
                 return;

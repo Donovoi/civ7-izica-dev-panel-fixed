@@ -22,18 +22,23 @@ function setup(specs=[{}],options={}){
     const cities=specs.map((spec,i)=>({id:id(spec.id??i+10,spec.owner??0),owner:spec.owner??0,name:spec.name??`Settlement ${i+1}`,
         population:spec.population??1,ready:spec.ready??false,ruralPlots:[...(spec.existingRural??[])],ruralSlots:[...(spec.rural??[101+i*100])],
         workers:(spec.workers??[]).map(w=>({plot:w.plot,count:w.count??0,max:w.max??1})),spec,inspections:0,removed:false}));
+    const plotOwners=new Map(cities.flatMap(city=>city.ruralPlots.map(plot=>[plot,key(city.id)])));
     const find=cityId=>cities.find(city=>!city.removed&&key(city.id)===key(cityId));
     const requireCity=(cityId,owner)=>{const city=find(cityId);if(!city||city.owner!==owner||city.id.owner!==owner)throw new Error('Settlement ownership changed');return city;};
     const emit=(name='CityPopulationChanged',data={})=>{for(const handler of [...(listeners.get(name)??[])])handler(data);};
     const announce=city=>{for(const name of ['CityPopulationChanged','CityGrowth','CityWorkerChanged','CityYieldChanged','CityAddedToMap'])emit(name,{city:city.id,player:city.owner});};
     const candidates=city=>[
-        ...city.ruralSlots.filter(plot=>!city.ruralPlots.includes(plot)).map(plot=>({kind:'rural',plot,location:location(plot)})),
+        ...city.ruralSlots.filter(plot=>!city.ruralPlots.includes(plot)
+            &&(!options.sharedPlots||!plotOwners.has(plot)||plotOwners.get(plot)===key(city.id)))
+            .map(plot=>({kind:'rural',plot,location:location(plot)})),
         ...city.workers.filter(worker=>worker.count<worker.max).map(worker=>({kind:'specialist',plot:worker.plot,location:location(worker.plot)})),
     ];
     const applyPlacement=(city,candidate)=>{
         if(candidate.kind==='rural'){
             assert(city.ruralSlots.includes(candidate.plot),'rural placement targeted an unavailable plot');
-            assert(!city.ruralPlots.includes(candidate.plot),'duplicate rural placement');city.ruralPlots.push(candidate.plot);
+            assert(!city.ruralPlots.includes(candidate.plot),'duplicate rural placement');
+            if(options.sharedPlots)assert(!plotOwners.has(candidate.plot)||plotOwners.get(candidate.plot)===key(city.id),'another settlement already owns this rural plot');
+            city.ruralPlots.push(candidate.plot);plotOwners.set(candidate.plot,key(city.id));
         }else{const worker=city.workers.find(w=>w.plot===candidate.plot);assert(worker&&worker.count<worker.max,'specialist placement exceeded target capacity');worker.count++;}
         city.ready=false;city.spec.afterPlace?.(city,candidate);announce(city);
     };
@@ -81,7 +86,7 @@ function setup(specs=[{}],options={}){
     const controller=new CityGrowthController(()=>runtime,{schedule:clock.schedule,unschedule:clock.unschedule,now:()=>clock.time,
         render:(...args)=>renders.push(args),report:(...args)=>reports.push(args)});
     const run=()=>{controller.start();clock.drain();};
-    return {controller,runtime,clock,events,cities,renders,reports,listeners,emit,announce,run,
+    return {controller,runtime,clock,events,cities,renders,reports,listeners,emit,announce,run,plotOwners,
         setPlayer:value=>{playerId=value;},setOwnership:(city,owner)=>{city.owner=owner;},candidates};
 }
 const tests=[];
@@ -158,6 +163,107 @@ await test('Multiple settlements make progress fairly instead of draining only t
 await test('A slow settlement does not prevent independent ready settlements from progressing',()=>{
     const s=setup([{rural:[1],grantDelay:1800},{rural:[2],ready:true}]);s.controller.start();s.clock.until(1000);
     assert(s.cities[1].ruralPlots.includes(2));assert(!s.cities[0].ruralPlots.includes(1));s.clock.drain();counts(s,2,0);stopped(s);
+});
+await test('A scheduled tick batches eight independent settlements and continues the remaining cities fairly',()=>{
+    const s=setup(Array.from({length:20},()=>({})),{grantDelay:700});s.controller.start();s.clock.next();
+    assert.equal(ops(s,'grant').length,8);assert.equal(s.controller.pending.size,8);
+    assert.equal(new Set(ops(s,'grant').map(e=>e.at)).size,1);
+    s.clock.next();assert.equal(ops(s,'grant').length,16);
+    s.clock.next();assert.equal(ops(s,'grant').length,20);assert.equal(s.controller.pending.size,20);
+    assert.deepEqual(ops(s,'grant').map(e=>e.city),s.cities.map(c=>c.id.id));
+    s.clock.until(600);assert.equal(ops(s,'grant').length,20);assert.equal(ops(s,'place').length,0);
+    s.clock.drain();counts(s,20,0);assert.equal(ops(s,'grant').length,20);assert.equal(ops(s,'place').length,20);stopped(s);
+});
+await test('Shared border plots are reserved so another ready city selects an independent alternative',()=>{
+    const s=setup([{ready:true,rural:[1]},{ready:true,rural:[1,2]}],{sharedPlots:true,placeDelay:600});
+    s.controller.start();s.clock.next();
+    assert.deepEqual(ops(s,'place').map(e=>[e.city,e.candidate.plot]),[[10,1],[11,2]]);
+    assert.equal(s.controller.pending.size,2);s.clock.until(500);assert.equal(ops(s,'place').length,2);
+    s.clock.drain();counts(s,2,0);assert.equal(ops(s,'grant').length,0);stopped(s);
+});
+await test('A city waits for a reserved sole border plot and then refreshes ownership instead of transferring it',()=>{
+    const s=setup([{ready:true,rural:[1]},{ready:true,rural:[1]}],{sharedPlots:true,placeDelay:600});
+    s.controller.start();s.clock.next();assert.equal(ops(s,'place').length,1);
+    assert.equal(s.controller.pending.size,1);assert.equal(s.controller.full.size,0);assert.equal(s.controller.blocked.size,0);
+    s.clock.until(500);assert.equal(ops(s,'place').length,1);assert.equal(s.controller.full.size,0);
+    s.clock.drain();counts(s,1,0);assert.equal(ops(s,'place').length,1);assert.equal(ops(s,'grant').length,0);
+    assert.deepEqual(s.cities[1].ruralPlots,[]);assert.equal(s.plotOwners.get(1),key(s.cities[0].id));stopped(s);
+});
+await test('A timed-out expansion reservation blocks dependent cities without creating new population',()=>{
+    const s=setup([{ready:true,rural:[1],dropPlace:true},{rural:[1]}],{sharedPlots:true});s.run();
+    assert.equal(ops(s,'place').length,1);assert.equal(ops(s,'grant').length,0);assert.equal(s.controller.pending.size,1);
+    assert.equal(s.controller.blocked.size,2);assert.match(s.controller.message,/waiting for unconfirmed expansion/);counts(s,0,0);stopped(s);
+    s.controller.start();s.clock.drain();assert.equal(ops(s,'place').length,1);assert.equal(ops(s,'grant').length,0);stopped(s);
+});
+await test('Reservations survive Stop and resume until late proof confirms the original placement',()=>{
+    const s=setup([{ready:true,rural:[1]},{ready:true,rural:[1]}],{sharedPlots:true,placeDelay:600});
+    s.controller.start();s.clock.next();assert.equal(ops(s,'place').length,1);s.controller.stop();
+    s.controller.start();s.clock.until(500);assert.equal(ops(s,'place').length,1);assert.equal(s.controller.pending.size,1);
+    s.clock.drain();counts(s,1,0);assert.equal(ops(s,'place').length,1);assert.equal(s.controller.pending.size,0);stopped(s);
+});
+await test('Pending population grants do not reserve land until an actual expansion is sent',()=>{
+    const s=setup([{rural:[1]},{rural:[1]}],{sharedPlots:true,grantDelay:400,placeDelay:600});
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,2);
+    assert.equal(s.controller.pending.size,2);assert([...s.controller.pending.values()].every(p=>p.kind==='grant'));
+    s.clock.drain();assert.equal(ops(s,'place').length,1);assert.equal(ops(s,'grant').length,2);counts(s,1,0);stopped(s);
+});
+await test('The per-tick wall budget yields between expensive city inspections without starving later cities',()=>{
+    const s=setup(Array.from({length:10},()=>({})),{grantDelay:700});
+    for(const city of s.cities)city.spec.onInspect=()=>{s.clock.time+=2;};
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,2);
+    assert.equal(s.controller.index,2);assert.equal(s.controller.pending.size,2);
+    s.clock.next();assert.equal(ops(s,'grant').length,4);
+    s.clock.drain();counts(s,10,0);assert.equal(ops(s,'grant').length,10);stopped(s);
+});
+await test('A city taking longer than the wall budget still makes one bounded step per tick',()=>{
+    const s=setup([{rural:[1]},{rural:[2]}],{grantDelay:700});
+    for(const city of s.cities)city.spec.onInspect=()=>{s.clock.time+=8;};
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,1);assert.equal(s.controller.index,1);
+    s.clock.next();assert.equal(ops(s,'grant').length,2);
+    s.clock.drain();counts(s,2,0);stopped(s);
+});
+await test('Duplicate settlement IDs never advance the same city twice in a batch',()=>{
+    const s=setup([{rural:[1,2]},{rural:[3]}],{inline:true});
+    const list=s.runtime.cityIds;s.runtime.cityIds=owner=>{const ids=list(owner);return[...Array(8).fill(ids[0]),ids[1],ids[1]];};
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,2);assert.equal(ops(s,'place').length,0);
+    assert.equal(s.controller.pending.size,2);s.clock.drain();counts(s,3,0);stopped(s);
+});
+await test('Native growth events preempt a later poll while bursts preserve one earliest timer',()=>{
+    const s=setup([{rural:[1]}],{grantDelay:60});s.controller.start();s.clock.next();
+    const oldTimer=s.controller.timer;assert.equal(s.controller.timerDue,125);
+    s.clock.next();assert.equal(s.clock.time,85);assert.equal(s.controller.timerDue,110);
+    assert(!s.clock.tasks.has(oldTimer),'later poll was not cancelled');
+    const earlier=s.controller.timer;
+    for(let i=0;i<20;i++)s.announce(s.cities[0]);s.controller.queue(500);
+    assert.equal(s.controller.timer,earlier);assert.equal(s.controller.timerDue,110);assert.equal(s.clock.tasks.size,1);
+    s.clock.drain();counts(s,1,0);assert.equal(ops(s,'grant').length,1);assert.equal(ops(s,'place').length,1);stopped(s);
+});
+await test('A stop during a synchronous batch dispatch prevents later cities and keeps its pending request',()=>{
+    const s=setup(Array.from({length:10},()=>({})),{grantDelay:700});const grant=s.runtime.grant;
+    s.runtime.grant=(...args)=>{const result=grant(...args);s.controller.stop();return result;};
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,1);assert.equal(s.controller.pending.size,1);
+    stopped(s);assert.equal(s.controller.timer,null);assert.equal(s.controller.timerDue,null);assert.match(s.controller.message,/Stopped/);
+    s.clock.drain();assert.equal(ops(s,'place').length,0);assert.equal(ops(s,'grant').length,1);
+});
+await test('A player change during a batch dispatch prevents every subsequent city request',()=>{
+    const s=setup(Array.from({length:10},()=>({})),{grantDelay:700});const grant=s.runtime.grant;
+    s.runtime.grant=(...args)=>{const result=grant(...args);s.setPlayer(1);return result;};
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,1);assert.equal(s.controller.pending.size,1);stopped(s);
+    s.clock.drain();assert.equal(ops(s,'place').length,0);assert.match(s.controller.message,/local player changed/);
+});
+await test('A player change or stop while inspecting a city prevents even that city from dispatching',()=>{
+    for(const mode of ['player','stop']){
+        const s=setup([{rural:[1]},{rural:[2]}]);
+        s.cities[0].spec.onInspect=()=>{if(mode==='player')s.setPlayer(1);else s.controller.stop();};
+        s.controller.start();s.clock.drain();assert.equal(s.events.length,0);assert.equal(s.controller.pending.size,0);stopped(s);
+    }
+});
+await test('A confirmed placement reaching the guard halts the remainder of its batch',()=>{
+    const s=setup([{ready:true,rural:[1]},{ready:true,rural:[2]}],{inline:true});s.controller.start();s.clock.next();
+    assert.equal(ops(s,'place').length,2);assert.equal(s.controller.pending.size,2);
+    s.controller.count={rural:49999,specialists:0};s.clock.next();stopped(s);
+    assert.equal(s.controller.count.rural,50000);assert.equal(s.controller.pending.size,1);
+    assert.equal(ops(s,'place').length,2);assert.match(s.controller.message,/operation guard/);
 });
 await test('Growth automatically assigned by the game needs no duplicate placement command',()=>{
     const s=setup([{rural:[1,2]}],{autoAssign:true});s.run();assert.equal(ops(s,'grant').length,2);assert.equal(ops(s,'place').length,0);counts(s,2,0);stopped(s);
