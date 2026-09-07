@@ -160,19 +160,20 @@ await test('Multiple settlements make progress fairly instead of draining only t
     const thirdFirst=s.events.findIndex((e,index)=>e.city===10&&e.kind==='place'&&s.events.slice(0,index).filter(x=>x.city===10&&x.kind==='place').length===2);
     assert(firstSecond>=0&&firstSecond<thirdFirst,'second settlement was starved until the first finished');stopped(s);
 });
-await test('A slow settlement does not prevent independent ready settlements from progressing',()=>{
+await test('A slow population grant holds other mutations until its native outcome is confirmed',()=>{
     const s=setup([{rural:[1],grantDelay:1800},{rural:[2],ready:true}]);s.controller.start();s.clock.until(1000);
-    assert(s.cities[1].ruralPlots.includes(2));assert(!s.cities[0].ruralPlots.includes(1));s.clock.drain();counts(s,2,0);stopped(s);
+    assert(!s.cities[1].ruralPlots.includes(2));assert(!s.cities[0].ruralPlots.includes(1));assert.equal(ops(s,'place').length,0);
+    s.clock.drain();counts(s,2,0);stopped(s);
 });
-await test('A scheduled tick batches eight independent settlements and continues the remaining cities fairly',()=>{
-    const s=setup(Array.from({length:20},()=>({})),{grantDelay:700});s.controller.start();s.clock.next();
-    assert.equal(ops(s,'grant').length,8);assert.equal(s.controller.pending.size,8);
-    assert.equal(new Set(ops(s,'grant').map(e=>e.at)).size,1);
-    s.clock.next();assert.equal(ops(s,'grant').length,16);
-    s.clock.next();assert.equal(ops(s,'grant').length,20);assert.equal(s.controller.pending.size,20);
-    assert.deepEqual(ops(s,'grant').map(e=>e.city),s.cities.map(c=>c.id.id));
-    s.clock.until(600);assert.equal(ops(s,'grant').length,20);assert.equal(ops(s,'place').length,0);
-    s.clock.drain();counts(s,20,0);assert.equal(ops(s,'grant').length,20);assert.equal(ops(s,'place').length,20);stopped(s);
+await test('A scheduled tick batches eight distinct ready placements and continues remaining cities fairly',()=>{
+    const s=setup(Array.from({length:20},()=>({ready:true})),{placeDelay:700});s.controller.start();s.clock.next();
+    assert.equal(ops(s,'place').length,8);assert.equal(s.controller.pending.size,8);
+    assert.equal(new Set(ops(s,'place').map(e=>e.at)).size,1);
+    s.clock.next();assert.equal(ops(s,'place').length,16);
+    s.clock.next();assert.equal(ops(s,'place').length,20);assert.equal(s.controller.pending.size,20);
+    assert.deepEqual(ops(s,'place').map(e=>e.city),s.cities.map(c=>c.id.id));
+    s.clock.until(600);assert.equal(ops(s,'place').length,20);assert.equal(ops(s,'grant').length,0);
+    s.clock.drain();counts(s,20,0);assert.equal(ops(s,'grant').length,0);assert.equal(ops(s,'place').length,20);stopped(s);
 });
 await test('Shared border plots are reserved so another ready city selects an independent alternative',()=>{
     const s=setup([{ready:true,rural:[1]},{ready:true,rural:[1,2]}],{sharedPlots:true,placeDelay:600});
@@ -192,7 +193,7 @@ await test('A city waits for a reserved sole border plot and then refreshes owne
 await test('A timed-out expansion reservation blocks dependent cities without creating new population',()=>{
     const s=setup([{ready:true,rural:[1],dropPlace:true},{rural:[1]}],{sharedPlots:true});s.run();
     assert.equal(ops(s,'place').length,1);assert.equal(ops(s,'grant').length,0);assert.equal(s.controller.pending.size,1);
-    assert.equal(s.controller.blocked.size,2);assert.match(s.controller.message,/waiting for unconfirmed expansion/);counts(s,0,0);stopped(s);
+    assert.equal(s.controller.blocked.size,2);assert.match(s.controller.message,/waiting for unconfirmed growth/);counts(s,0,0);stopped(s);
     s.controller.start();s.clock.drain();assert.equal(ops(s,'place').length,1);assert.equal(ops(s,'grant').length,0);stopped(s);
 });
 await test('Reservations survive Stop and resume until late proof confirms the original placement',()=>{
@@ -201,31 +202,86 @@ await test('Reservations survive Stop and resume until late proof confirms the o
     s.controller.start();s.clock.until(500);assert.equal(ops(s,'place').length,1);assert.equal(s.controller.pending.size,1);
     s.clock.drain();counts(s,1,0);assert.equal(ops(s,'place').length,1);assert.equal(s.controller.pending.size,0);stopped(s);
 });
-await test('Pending population grants do not reserve land until an actual expansion is sent',()=>{
-    const s=setup([{rural:[1]},{rural:[1]}],{sharedPlots:true,grantDelay:400,placeDelay:600});
-    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,2);
-    assert.equal(s.controller.pending.size,2);assert([...s.controller.pending.values()].every(p=>p.kind==='grant'));
-    s.clock.drain();assert.equal(ops(s,'place').length,1);assert.equal(ops(s,'grant').length,2);counts(s,1,0);stopped(s);
+await test('Overlapping automatic population grants serialize before either can claim the shared plot',()=>{
+    const s=setup([{rural:[1],autoAssign:true},{rural:[1],autoAssign:true}],{sharedPlots:true,grantDelay:400});
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,1);assert.equal(s.controller.pending.size,1);
+    s.clock.drain();assert.equal(ops(s,'place').length,0);assert.equal(ops(s,'grant').length,1);counts(s,1,0);stopped(s);
+});
+await test('An automatic grant and an explicit placement never overlap on a shared tile in either order',()=>{
+    for(const grantFirst of [true,false]){
+        const grant={rural:[1],autoAssign:true,grantDelay:100};const place={ready:true,rural:[1],placeDelay:600};
+        const s=setup(grantFirst?[grant,place]:[place,grant],{sharedPlots:true});s.controller.start();s.clock.next();
+        assert.equal(s.events.length,1);assert.equal(s.events[0].kind,grantFirst?'grant':'place');assert.equal(s.controller.pending.size,1);
+        s.clock.drain();counts(s,1,0);assert.equal(s.events.length,1);stopped(s);
+    }
+});
+await test('A grant barrier protects every candidate including tiles other than its first choice',()=>{
+    const s=setup([{rural:[1,2],autoAssign:true,grantDelay:100},{ready:true,rural:[2],placeDelay:600}],{sharedPlots:true});
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,1);assert.equal(ops(s,'place').length,0);
+    assert.equal([...s.controller.pending.values()][0].candidate.plot,1);
+    s.clock.drain();counts(s,2,0);assert(s.cities[0].ruralPlots.includes(1));assert(s.cities[1].ruralPlots.includes(2));stopped(s);
+});
+await test('An unready city cannot grant around a reserved plot by choosing an unreserved alternative',()=>{
+    const s=setup([{ready:true,rural:[1],placeDelay:600},{rural:[2,1],autoAssign:true,grantDelay:100}],{sharedPlots:true});
+    s.controller.start();s.clock.next();assert.equal(ops(s,'place').length,1);assert.equal(ops(s,'grant').length,0);
+    s.clock.until(600);assert.equal(ops(s,'grant').length,0);
+    s.clock.drain();counts(s,2,0);assert.equal(ops(s,'grant').length,1);assert.deepEqual(s.cities[1].ruralPlots,[2]);stopped(s);
+});
+await test('Even known disjoint grants are global barriers against ready placements in either order',()=>{
+    for(const grantFirst of [true,false]){
+        const grant={rural:[1],autoAssign:true,grantDelay:600};const place={ready:true,rural:[2],placeDelay:600};
+        const s=setup(grantFirst?[grant,place]:[place,grant],{sharedPlots:true});s.controller.start();s.clock.next();
+        assert.equal(s.events.length,1);assert.equal(s.events[0].kind,grantFirst?'grant':'place');
+        s.clock.until(600);assert.equal(s.events.length,1);
+        s.clock.drain();counts(s,2,0);assert.equal(ops(s,'grant').length,1);assert.equal(ops(s,'place').length,1);stopped(s);
+    }
+});
+await test('Disjoint automatic grants serialize until confirmation without starving the second city',()=>{
+    const s=setup([{rural:[1],autoAssign:true},{rural:[2],autoAssign:true}],{sharedPlots:true,grantDelay:600});
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,1);assert.equal(s.controller.pending.size,1);
+    s.clock.until(600);assert.equal(ops(s,'grant').length,1);
+    s.clock.drain();assert.equal(ops(s,'grant').length,2);assert.equal(ops(s,'place').length,0);counts(s,2,0);stopped(s);
+});
+await test('Unknown-footprint grants wait for or block every other mutation in both request orderings',()=>{
+    for(const grantFirst of [true,false]){
+        const grant={rural:[1],ruralAvailable:false,autoAssign:true,grantDelay:600,afterGrant:city=>{city.spec.ruralAvailable=true;}};
+        const place={ready:true,rural:[2],placeDelay:600};
+        const s=setup(grantFirst?[grant,place]:[place,grant],{sharedPlots:true});s.controller.start();s.clock.next();
+        assert.equal(s.events.length,1);assert.equal(s.events[0].kind,grantFirst?'grant':'place');
+        s.clock.until(600);assert.equal(s.events.length,1);
+        s.clock.drain();counts(s,2,0);assert.equal(ops(s,'grant').length,1);assert.equal(ops(s,'place').length,1);stopped(s);
+    }
+});
+await test('Unconfirmed known or unknown grants remain global barriers across timeouts and Stop resume',()=>{
+    for(const ruralAvailable of [true,false]){
+        const s=setup([{rural:[1],ruralAvailable,dropGrant:true},{ready:true,rural:[2]}],{sharedPlots:true});
+        s.controller.start();s.clock.next();s.controller.stop();s.controller.start();s.clock.drain();
+        assert.equal(ops(s,'grant').length,1);assert.equal(ops(s,'place').length,0);assert.equal(s.controller.pending.size,1);
+        assert.equal(s.controller.blocked.size,2);assert.match(s.controller.message,/waiting for unconfirmed growth/);stopped(s);
+        s.controller.start();s.clock.drain();assert.equal(ops(s,'grant').length,1);assert.equal(ops(s,'place').length,0);stopped(s);
+        s.cities[0].population++;s.cities[0].ready=true;s.cities[0].spec.ruralAvailable=true;
+        s.controller.start();s.clock.drain();assert.equal(ops(s,'grant').length,1);assert.equal(ops(s,'place').length,2);counts(s,2,0);stopped(s);
+    }
 });
 await test('The per-tick wall budget yields between expensive city inspections without starving later cities',()=>{
-    const s=setup(Array.from({length:10},()=>({})),{grantDelay:700});
+    const s=setup(Array.from({length:10},()=>({ready:true})),{placeDelay:700});
     for(const city of s.cities)city.spec.onInspect=()=>{s.clock.time+=2;};
-    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,2);
+    s.controller.start();s.clock.next();assert.equal(ops(s,'place').length,2);
     assert.equal(s.controller.index,2);assert.equal(s.controller.pending.size,2);
-    s.clock.next();assert.equal(ops(s,'grant').length,4);
-    s.clock.drain();counts(s,10,0);assert.equal(ops(s,'grant').length,10);stopped(s);
+    s.clock.next();assert.equal(ops(s,'place').length,4);
+    s.clock.drain();counts(s,10,0);assert.equal(ops(s,'place').length,10);stopped(s);
 });
 await test('A city taking longer than the wall budget still makes one bounded step per tick',()=>{
-    const s=setup([{rural:[1]},{rural:[2]}],{grantDelay:700});
+    const s=setup([{ready:true,rural:[1]},{ready:true,rural:[2]}],{placeDelay:700});
     for(const city of s.cities)city.spec.onInspect=()=>{s.clock.time+=8;};
-    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,1);assert.equal(s.controller.index,1);
-    s.clock.next();assert.equal(ops(s,'grant').length,2);
+    s.controller.start();s.clock.next();assert.equal(ops(s,'place').length,1);assert.equal(s.controller.index,1);
+    s.clock.next();assert.equal(ops(s,'place').length,2);
     s.clock.drain();counts(s,2,0);stopped(s);
 });
 await test('Duplicate settlement IDs never advance the same city twice in a batch',()=>{
-    const s=setup([{rural:[1,2]},{rural:[3]}],{inline:true});
+    const s=setup([{ready:true,rural:[1,2]},{ready:true,rural:[3]}],{inline:true});
     const list=s.runtime.cityIds;s.runtime.cityIds=owner=>{const ids=list(owner);return[...Array(8).fill(ids[0]),ids[1],ids[1]];};
-    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,2);assert.equal(ops(s,'place').length,0);
+    s.controller.start();s.clock.next();assert.equal(ops(s,'grant').length,0);assert.equal(ops(s,'place').length,2);
     assert.equal(s.controller.pending.size,2);s.clock.drain();counts(s,3,0);stopped(s);
 });
 await test('Native growth events preempt a later poll while bursts preserve one earliest timer',()=>{
@@ -315,7 +371,7 @@ await test('Existing rural tiles and worker counts are not included in this run 
     const s=setup([{existingRural:[1],rural:[1,2],workers:[{plot:3,count:2,max:3}]}]);s.run();counts(s,1,1);assert.equal(ops(s,'grant').length,2);stopped(s);
 });
 await test('A blocked city cannot hide successful growth in another city',()=>{
-    const s=setup([{rural:[1],dropGrant:true},{rural:[2]}]);s.run();assert(s.cities[1].ruralPlots.includes(2));counts(s,1,0);assert(s.controller.blocked.size>0);notMaxed(s);stopped(s);
+    const s=setup([{ready:true,rural:[1],dropPlace:true},{ready:true,rural:[2]}]);s.run();assert(s.cities[1].ruralPlots.includes(2));counts(s,1,0);assert(s.controller.blocked.size>0);notMaxed(s);stopped(s);
 });
 await test('Rejected or thrown grants terminate without repeated uncertain mutations',()=>{
     for(const flag of ['grantFalse','grantThrows']){const s=setup([{rural:[1]}],{[flag]:true});s.run();

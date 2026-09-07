@@ -235,20 +235,26 @@ export class CityGrowthController {
                 return;
             }
             const rejected = this.rejectedCandidates.get(cityKey) ?? new Set();
-            // Two settlements can expose the same unclaimed border tile.
-            // Keep every other city's pending placement reserved, including
-            // uncertain requests retained after Stop or a timeout.
-            const reservations = new Map([...this.pending]
-                .filter(([otherKey, request]) => otherKey !== cityKey && request.kind === "placement" && request.candidate)
-                .map(([otherKey, request]) => [request.candidate.plot, otherKey]));
+            // Native growth grants may assign population automatically, without
+            // a documented target boundary. Serialize them against every other
+            // city's pending mutation. Retained uncertain requests keep this
+            // barrier after Stop/timeout; explicit placements reserve one plot.
+            const reservations = [...this.pending]
+                .filter(([otherKey]) => otherKey !== cityKey)
+                .map(([owner, request]) => ({ owner, kind: request.kind, plot: request.candidate?.plot }));
+            const waitFor = conflicts => {
+                if (conflicts.every(claim => this.blocked.has(claim.owner))) {
+                    this.blocked.set(cityKey, `${state.name}: waiting for unconfirmed growth in another settlement`);
+                }
+            };
+            const grantBarriers = state.ready ? reservations.filter(claim => claim.kind === "grant") : reservations;
+            if (grantBarriers.length) { waitFor(grantBarriers); return; }
             const legalCandidates = state.candidates.filter(c => !rejected.has(`${c.kind}:${c.plot}`));
-            const candidate = legalCandidates.find(c => !reservations.has(c.plot));
+            const candidate = legalCandidates.find(c => !reservations.some(claim => claim.plot === c.plot));
             if (!candidate && state.candidates.length) {
-                const waiting = legalCandidates.filter(c => reservations.has(c.plot));
+                const waiting = reservations.filter(claim => legalCandidates.some(c => claim.plot === c.plot));
                 if (waiting.length) {
-                    if (waiting.every(c => this.blocked.has(reservations.get(c.plot)))) {
-                        this.blocked.set(cityKey, `${state.name}: waiting for unconfirmed expansion in another settlement`);
-                    }
+                    waitFor(waiting);
                     return;
                 }
                 this.blocked.set(cityKey, `${state.name}: the game rejected all remaining growth placements`);
